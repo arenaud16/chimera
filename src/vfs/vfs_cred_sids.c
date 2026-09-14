@@ -92,6 +92,40 @@ chimera_vfs_cred_sids_set_key(
     memcpy(entry->gids, cred->gids, cred->ngids * sizeof(cred->gids[0]));
 } /* chimera_vfs_cred_sids_set_key */
 
+/*
+ * Bucket index for a credential hash.
+ *
+ * chimera_vfs_cred_hash() is a word-wise FNV-1a over flavor, uid, gid and the
+ * supplementary gids.  Three or four multiplies is not enough to avalanche it:
+ * the low bits of a product depend only on the low bits of its operands, so
+ * uid and gid moving in step (the ubiquitous user-private-group layout, uid ==
+ * gid) largely cancel there, and the high bits of the accumulator barely move
+ * at all for realistic id ranges.  Indexing off either end therefore piles
+ * every caller into a handful of buckets: measured over 400 sequential
+ * uid/gid pairs, the low six bits reach 13 of the 64 buckets and the cache
+ * retains 52 of a nominal 256 entries.  That is not merely a performance
+ * matter here -- the NFS funnel proceeds unenforced on a miss, so a table that
+ * evicts between requests makes the same operation by the same caller
+ * enforced or not depending on cache state.
+ *
+ * Avalanche the hash first (the murmur3 64-bit finalizer) so every input bit
+ * reaches the index.  The same 400 pairs then reach all 64 buckets and retain
+ * 243 entries.  A fold of the high half onto the low one is NOT enough: bits
+ * 32-37 of the FNV accumulator are constant across such a sweep, so it lands
+ * on exactly the 13 buckets the low bits alone do.
+ */
+static inline unsigned int
+chimera_vfs_cred_sids_bucket(uint64_t hash)
+{
+    hash ^= hash >> 33;
+    hash *= 0xff51afd7ed558ccdULL;
+    hash ^= hash >> 33;
+    hash *= 0xc4ceb9fe1a85ec53ULL;
+    hash ^= hash >> 33;
+
+    return (unsigned int) (hash % CHIMERA_VFS_CRED_SIDS_BUCKETS);
+} /* chimera_vfs_cred_sids_bucket */
+
 static struct chimera_vfs_cred_sids_entry *
 chimera_vfs_cred_sids_find(
     struct chimera_vfs_thread     *thread,
@@ -106,7 +140,7 @@ chimera_vfs_cred_sids_find(
         return NULL;
     }
 
-    entry = thread->cred_sids->buckets[hash % CHIMERA_VFS_CRED_SIDS_BUCKETS];
+    entry = thread->cred_sids->buckets[chimera_vfs_cred_sids_bucket(hash)];
 
     while (entry) {
         if (entry->hash == hash &&
@@ -144,7 +178,7 @@ chimera_vfs_cred_sids_intern(
         return entry;
     }
 
-    b      = hash % CHIMERA_VFS_CRED_SIDS_BUCKETS;
+    b      = chimera_vfs_cred_sids_bucket(hash);
     victim = NULL;
 
     for (entry = thread->cred_sids->buckets[b]; entry; entry = entry->next) {

@@ -377,6 +377,21 @@ test_eviction_keeps_entries_honest(
     /* The sweep has to have overflowed the cache, or it proved nothing. */
     assert(cached < TEST_EVICT_N);
 
+    /* ...and the cache has to have used its whole table while doing it.  The
+     * bucket index is taken from an avalanched credential hash for this
+     * reason: indexing off the raw hash instead piles sequential uid/gid pairs
+     * into a fraction of the buckets and collapses what the cache retains
+     * (measured: 52 here, against 243 once the index is mixed).  A thinly
+     * spread cache is an enforcement bug, not just a slow one -- the NFS
+     * funnel proceeds unenforced on a miss, so entries evicted between
+     * requests make the same operation by the same caller enforced or not
+     * depending on cache state.
+     *
+     * The floor is deliberately loose: the bucket count and chain depth are
+     * private to vfs_cred_sids.c, so this pins the property (most of the
+     * sweep survives) rather than the sizes. */
+    assert(cached > TEST_EVICT_N / 4);
+
     fprintf(stderr, "  (cache kept %d of %d credentials)\n", cached,
             TEST_EVICT_N);
     TEST_PASS("an evicting cache never answers with another credential's SIDs");
