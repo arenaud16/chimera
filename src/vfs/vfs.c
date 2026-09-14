@@ -24,6 +24,7 @@
 #include "vfs/vfs_attr_cache.h"
 #include "vfs/vfs_user_cache.h"
 #include "vfs/vfs_identity.h"
+#include "vfs/vfs_cred_sids.h"
 #include "vfs/vfs_notify.h"
 #include "vfs/vfs_claim.h"
 #include "vfs/vfs_pnfs.h"
@@ -1279,6 +1280,8 @@ chimera_vfs_thread_destroy(struct chimera_vfs_thread *thread)
 
         module->thread_destroy(thread->module_private[i]);
     }
+
+    chimera_vfs_cred_sids_thread_destroy(thread);
 
     while (thread->free_find_results) {
         find_result = thread->free_find_results;

@@ -15,6 +15,7 @@ add_compile_definitions(_LGPL_SOURCE)
 
 add_library(chimera_vfs SHARED vfs.c vfs_lsan.c vfs_cred.c vfs_sdk_utils.c
             vfs_acl.c vfs_acl_serialize.c vfs_access.c vfs_idmap.c vfs_identity.c
+            vfs_cred_sids.c
             vfs_sid.c
             vfs_proc_mount.c vfs_proc_umount.c
             vfs_proc_mkfs.c vfs_proc_rmfs.c

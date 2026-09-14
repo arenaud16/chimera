@@ -153,6 +153,7 @@ struct chimera_vfs_mount_table;
 struct chimera_vfs_notify;
 struct chimera_vfs_state;
 struct chimera_vfs_pnfs;
+struct chimera_vfs_cred_sids_cache;
 
 struct chimera_vfs {
     struct chimera_vfs_module            *modules[CHIMERA_VFS_MAX_MODULES];
@@ -204,6 +205,8 @@ struct chimera_vfs_thread {
     struct chimera_vfs_request          *pending_complete_requests;
     struct chimera_vfs_request          *unblocked_requests;
     struct chimera_vfs_identity_request *pending_identity;
+    /* Native SIDs per credential seen on this thread (see vfs_cred_sids.h). */
+    struct chimera_vfs_cred_sids_cache  *cred_sids;
     /* Parked I/O requests being resumed on their owning thread (the lease
      * pump runs on whatever thread released/broke a lease, but a request's
      * dispatch+reply must run on the thread that owns its connection iovecs). */
