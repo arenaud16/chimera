@@ -22,10 +22,22 @@ struct chimera_vfs_cred_sids_entry {
     struct chimera_vfs_cred_sids_entry *next;
     uint64_t                            hash;
     int                                 valid;
-    /* Resolves still filling this entry.  One with lookups outstanding must
-     * not be recycled under a different credential: their contexts hold it by
-     * pointer and would publish this caller's SIDs under the other's hash. */
+    /* Resolves still filling this entry, plus the callback each of them is
+     * running.  An entry with either outstanding must not be recycled under a
+     * different credential: a resolve holds it by pointer and would publish
+     * this caller's SIDs under the other's hash, and a callback is reading the
+     * very set it was handed. */
     uint32_t                            inflight;
+    /* The credential this entry describes, compared in full on a hash match.
+     * chimera_vfs_cred_hash() tolerates collisions because the open-handle
+     * cache it was written for merely shares a handle on one; here a collision
+     * would answer one caller's access check with another caller's SIDs, so
+     * the hash only selects a candidate and these fields decide. */
+    enum chimera_vfs_cred_flavor        flavor;
+    uint32_t                            uid;
+    uint32_t                            gid;
+    uint32_t                            ngids;
+    uint32_t                            gids[CHIMERA_VFS_CRED_MAX_GIDS];
     struct chimera_vfs_cred_sids        sids;
 };
 
@@ -48,21 +60,57 @@ struct chimera_vfs_cred_sids_ctx {
     struct chimera_vfs_cred_sids_slot   slots[CHIMERA_VFS_CRED_MAX_GIDS + 2];
 };
 
+/* Does `entry` describe exactly `cred`?  Every field the hash mixes, compared
+ * directly; only the first `ngids` supplementary gids are meaningful. */
+static int
+chimera_vfs_cred_sids_key_eq(
+    const struct chimera_vfs_cred_sids_entry *entry,
+    const struct chimera_vfs_cred            *cred)
+{
+    if (entry->flavor != cred->flavor ||
+        entry->uid != cred->uid ||
+        entry->gid != cred->gid ||
+        entry->ngids != cred->ngids) {
+        return 0;
+    }
+
+    return memcmp(entry->gids, cred->gids,
+                  cred->ngids * sizeof(cred->gids[0])) == 0;
+} /* chimera_vfs_cred_sids_key_eq */
+
+static void
+chimera_vfs_cred_sids_set_key(
+    struct chimera_vfs_cred_sids_entry *entry,
+    const struct chimera_vfs_cred      *cred,
+    uint64_t                            hash)
+{
+    entry->hash   = hash;
+    entry->flavor = cred->flavor;
+    entry->uid    = cred->uid;
+    entry->gid    = cred->gid;
+    entry->ngids  = cred->ngids;
+    memcpy(entry->gids, cred->gids, cred->ngids * sizeof(cred->gids[0]));
+} /* chimera_vfs_cred_sids_set_key */
+
 static struct chimera_vfs_cred_sids_entry *
 chimera_vfs_cred_sids_find(
-    struct chimera_vfs_thread *thread,
-    uint64_t                   hash)
+    struct chimera_vfs_thread     *thread,
+    const struct chimera_vfs_cred *cred,
+    uint64_t                       hash)
 {
     struct chimera_vfs_cred_sids_entry *entry;
 
-    if (!thread->cred_sids) {
+    /* Nothing is ever interned for a credential-less (internal/server)
+     * operation, so there is nothing here to find for one either. */
+    if (!cred || !thread->cred_sids) {
         return NULL;
     }
 
     entry = thread->cred_sids->buckets[hash % CHIMERA_VFS_CRED_SIDS_BUCKETS];
 
     while (entry) {
-        if (entry->hash == hash) {
+        if (entry->hash == hash &&
+            chimera_vfs_cred_sids_key_eq(entry, cred)) {
             return entry;
         }
         entry = entry->next;
@@ -79,8 +127,9 @@ chimera_vfs_cred_sids_find(
  */
 static struct chimera_vfs_cred_sids_entry *
 chimera_vfs_cred_sids_intern(
-    struct chimera_vfs_thread *thread,
-    uint64_t                   hash)
+    struct chimera_vfs_thread     *thread,
+    const struct chimera_vfs_cred *cred,
+    uint64_t                       hash)
 {
     struct chimera_vfs_cred_sids_entry *entry, *victim, *keep;
     unsigned int                        b;
@@ -90,7 +139,7 @@ chimera_vfs_cred_sids_intern(
         thread->cred_sids = calloc(1, sizeof(*thread->cred_sids));
     }
 
-    entry = chimera_vfs_cred_sids_find(thread, hash);
+    entry = chimera_vfs_cred_sids_find(thread, cred, hash);
     if (entry) {
         return entry;
     }
@@ -99,8 +148,8 @@ chimera_vfs_cred_sids_intern(
     victim = NULL;
 
     for (entry = thread->cred_sids->buckets[b]; entry; entry = entry->next) {
-        /* The last entry in the chain that no resolve is still filling: the
-         * least recently interned one that is safe to repurpose. */
+        /* The last entry in the chain with inflight == 0: the least recently
+         * interned one that is safe to repurpose. */
         if (entry->inflight == 0) {
             victim = entry;
         }
@@ -108,21 +157,29 @@ chimera_vfs_cred_sids_intern(
     }
 
     /* Bucket full: reuse that entry in place, keeping it linked where it is.
-     * Safe because a borrowed set never outlives its callback, and no resolve
-     * can start while another's callback is running on this single-threaded
-     * loop.  If every entry in the chain is still being resolved there is
-     * nothing to reuse, so the chain grows past the bound until they finish. */
+     *
+     * `inflight` is the whole of the invariant.  Non-zero means either a
+     * resolve is still filling the entry (its context and its outstanding
+     * lookups hold it by pointer) or a callback is reading the set it was just
+     * handed; repurposing it in either state would publish one caller's SIDs
+     * under another caller's key.  Zero means nothing holds it and stamping a
+     * new credential on it is safe.  Note this is NOT implied by callbacks
+     * running to completion on a single-threaded loop: a parked resolve spans
+     * many trips round that loop, and other resolves start meanwhile.
+     *
+     * If every entry in the chain is held there is nothing to reuse, so the
+     * chain grows past the bound until they finish. */
     if (n >= CHIMERA_VFS_CRED_SIDS_CHAIN && victim) {
         keep = victim->next;
         memset(victim, 0, sizeof(*victim));
         victim->next = keep;
-        victim->hash = hash;
+        chimera_vfs_cred_sids_set_key(victim, cred, hash);
         return victim;
     }
 
     entry       = calloc(1, sizeof(*entry));
-    entry->hash = hash;
     entry->next = thread->cred_sids->buckets[b];
+    chimera_vfs_cred_sids_set_key(entry, cred, hash);
 
     thread->cred_sids->buckets[b] = entry;
 
@@ -154,11 +211,19 @@ chimera_vfs_cred_sids_decr(struct chimera_vfs_cred_sids_ctx *ctx)
     }
 
     entry->valid = any;
-    entry->inflight--;
 
     free(ctx);
 
     callback(any ? &entry->sids : NULL, private_data);
+
+    /* Unpinned only now.  For the duration of the callback the entry is still
+     * held -- by the very set just handed out -- and dropping the pin above
+     * would make it an eligible eviction victim while the callback reads it.
+     * That is reachable: a callback may start a cold resolve of its own (the
+     * per-request funnel warms every credential it sees), and if that lands in
+     * this full bucket and completes inline, the borrowed set would turn into
+     * another caller's before the callback returned. */
+    entry->inflight--;
 } /* chimera_vfs_cred_sids_decr */
 
 static void
@@ -195,7 +260,8 @@ chimera_vfs_cred_sids_lookup(
 {
     struct chimera_vfs_cred_sids_entry *entry;
 
-    entry = chimera_vfs_cred_sids_find(thread, chimera_vfs_cred_hash(cred));
+    entry = chimera_vfs_cred_sids_find(thread, cred,
+                                       chimera_vfs_cred_hash(cred));
 
     return (entry && entry->valid) ? &entry->sids : NULL;
 } /* chimera_vfs_cred_sids_lookup */
@@ -213,20 +279,26 @@ chimera_vfs_cred_resolve_sids(
     uint32_t                            i, nslots;
 
     hash  = chimera_vfs_cred_hash(cred);
-    entry = chimera_vfs_cred_sids_find(thread, hash);
+    entry = chimera_vfs_cred_sids_find(thread, cred, hash);
 
-    /* Warm: no allocation, no lookup, no park. */
+    /* Warm: no allocation, no lookup, no park.  Pinned across the callback for
+     * the same reason the cold path is -- the callback holds the set, and a
+     * resolve it starts of its own must not evict it underneath. */
     if (entry && entry->valid) {
+        entry->inflight++;
         callback(&entry->sids, private_data);
+        entry->inflight--;
         return;
     }
 
-    entry = chimera_vfs_cred_sids_intern(thread, hash);
+    entry = chimera_vfs_cred_sids_intern(thread, cred, hash);
 
     /* Only reset an entry nothing else is filling.  A resolve already running
-     * on this credential is writing the same slots from the same ids, so
-     * joining it in place is idempotent, where clearing under it would discard
-     * what it has already resolved. */
+     * here is running on the same credential -- the entry key is compared in
+     * full, so a joined entry cannot belong to a different caller -- and is
+     * writing the same slots from the same ids, so joining it in place is
+     * idempotent, where clearing under it would discard what it has already
+     * resolved. */
     if (entry->inflight == 0) {
         memset(&entry->sids, 0, sizeof(entry->sids));
         entry->valid = 0;

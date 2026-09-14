@@ -15,9 +15,22 @@
  * O(ACEs) per access and would have to copy and rewrite an ACL that belongs to
  * the backend.
  *
- * Results are cached per VFS thread, keyed by chimera_vfs_cred_hash(), so a
- * repeat caller resolves with no lock and no allocation.  A returned set is
- * BORROWED: it is valid until the calling thread returns to its event loop.
+ * Results are cached per VFS thread, keyed by chimera_vfs_cred_hash() and
+ * confirmed against the credential itself, so a repeat caller resolves with no
+ * lock and no allocation.
+ *
+ * A returned set is BORROWED from that cache, which reuses its entries once a
+ * hash bucket fills.  How long the borrow lasts depends on how it was obtained:
+ *
+ *   - A set handed to a chimera_vfs_cred_sids_callback is pinned for the
+ *     duration of that callback.  It stays valid even if the callback resolves
+ *     another credential, so it is always safe to read and to copy there.
+ *
+ *   - A set returned by chimera_vfs_cred_sids_lookup() is pinned by nothing.
+ *     It is valid only until this thread next calls
+ *     chimera_vfs_cred_resolve_sids() or chimera_vfs_cred_sids_warm(), and
+ *     never past the current trip through the event loop.
+ *
  * Copy it if it must live longer (an SMB session does exactly that).
  */
 
@@ -32,7 +45,8 @@ typedef void (*chimera_vfs_cred_sids_callback)(
 /*
  * Resolve `cred` to its SID set.  On a warm cache the callback fires inline,
  * before this returns; otherwise it fires later on `thread`'s evpl loop.
- * `sids` is NULL when nothing about the caller could be resolved.
+ * `sids` is NULL when nothing about the caller could be resolved, and is
+ * pinned for the duration of the callback otherwise.
  */
 void
 chimera_vfs_cred_resolve_sids(
@@ -45,6 +59,9 @@ chimera_vfs_cred_resolve_sids(
  * Synchronous probe: the cached SID set for `cred` on this thread, or NULL.
  * Never resolves and never blocks, so it is safe on a path that cannot park
  * (the per-request NFS credential funnel, a readdir entry callback).
+ *
+ * The result is unpinned -- see the borrow rules above.  Use it, or copy it,
+ * before starting another resolve on this thread.
  */
 const struct chimera_vfs_cred_sids *
 chimera_vfs_cred_sids_lookup(

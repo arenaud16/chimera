@@ -237,6 +237,268 @@ test_warm_feeds_lookup(
     TEST_PASS("warm leaves the set where a synchronous lookup finds it");
 } /* test_warm_feeds_lookup */
 
+/*
+ * Eviction.  The cache is a fixed number of buckets with a bounded chain each,
+ * so resolving many more credentials than it holds forces entries to be
+ * recycled.  Whatever it chooses to keep must still be right: a cached set
+ * belongs to the credential that asked for it, or the credential is not cached
+ * at all.  Anything else means an entry was repurposed while something still
+ * held it, or a stale entry was matched on its hash alone.
+ *
+ * Deliberately probabilistic rather than a hand-built bucket collision: the
+ * bucket count and chain depth are private to vfs_cred_sids.c, and a test that
+ * hardcoded them would silently stop forcing eviction the day they changed.
+ */
+#define TEST_EVICT_N        400
+#define TEST_EVICT_UID_BASE 700000
+#define TEST_EVICT_GID_BASE 800000
+
+/* Indices [0, TEST_EVICT_N) belong to the eviction sweep; the pin sweep below
+ * takes the next TEST_PIN_N.  evict_handler names the whole range. */
+#define TEST_PIN_FIRST      TEST_EVICT_N
+#define TEST_PIN_N          300
+#define TEST_EVICT_RANGE    (TEST_EVICT_N + TEST_PIN_N)
+
+/* Credentials nothing names, used only to push entries out of a full bucket. */
+#define TEST_NEST_UID_BASE  900000
+#define TEST_NEST_GID_BASE  910000
+
+static void
+evict_expect_user_sid(
+    int   i,
+    char *buf,
+    int   buflen)
+{
+    snprintf(buf, buflen, "S-1-5-21-500-600-700-%d", 1000 + i);
+} /* evict_expect_user_sid */
+
+static void
+evict_expect_group_sid(
+    int   i,
+    char *buf,
+    int   buflen)
+{
+    snprintf(buf, buflen, "S-1-5-21-500-600-700-%d", 2000 + i);
+} /* evict_expect_group_sid */
+
+/* Gives every credential in the sweep its own distinct user and group SID. */
+static int
+evict_handler(
+    enum chimera_vfs_identity_key       key,
+    uint32_t                            id,
+    const char                         *name,
+    struct chimera_vfs_identity_result *out,
+    void                               *private_data)
+{
+    (void) name;
+    (void) private_data;
+
+    if (key == CHIMERA_VFS_IDENTITY_BY_UID &&
+        id >= TEST_EVICT_UID_BASE && id < TEST_EVICT_UID_BASE + TEST_EVICT_RANGE) {
+        out->is_group = 0;
+        out->user.uid = id;
+        out->user.gid = TEST_EVICT_GID_BASE + (id - TEST_EVICT_UID_BASE);
+        snprintf(out->user.username, sizeof(out->user.username), "ev%u", id);
+        out->user.username_len = (int) strlen(out->user.username);
+        evict_expect_user_sid((int) (id - TEST_EVICT_UID_BASE),
+                              out->user.sid, sizeof(out->user.sid));
+        return 0;
+    }
+
+    if (key == CHIMERA_VFS_IDENTITY_BY_GID &&
+        id >= TEST_EVICT_GID_BASE && id < TEST_EVICT_GID_BASE + TEST_EVICT_RANGE) {
+        out->is_group  = 1;
+        out->group.gid = id;
+        snprintf(out->group.groupname, sizeof(out->group.groupname),
+                 "evg%u", id);
+        out->group.groupname_len = (int) strlen(out->group.groupname);
+        evict_expect_group_sid((int) (id - TEST_EVICT_GID_BASE),
+                               out->group.sid, sizeof(out->group.sid));
+        return 0;
+    }
+
+    return -1;
+} /* evict_handler */
+
+static void
+test_eviction_keeps_entries_honest(
+    struct chimera_vfs        *vfs,
+    struct chimera_vfs_thread *thread,
+    struct evpl               *evpl)
+{
+    struct chimera_vfs_cred cred;
+    struct sids_probe       p;
+    char                    expect[CHIMERA_SID_STR_MAX];
+    int                     i, cached = 0;
+
+    chimera_vfs_identity_register_handler(vfs, evict_handler, NULL);
+
+    for (i = 0; i < TEST_EVICT_N; i++) {
+        chimera_vfs_cred_init_unix(&cred, TEST_EVICT_UID_BASE + i,
+                                   TEST_EVICT_GID_BASE + i, 0, NULL);
+
+        memset(&p, 0, sizeof(p));
+        chimera_vfs_cred_resolve_sids(thread, &cred, sids_cb, &p);
+        while (!p.done) {
+            evpl_continue(evpl);
+        }
+
+        /* Each resolve must answer with its OWN credential's SIDs, however
+         * much churn the cache is under by now. */
+        assert(p.have);
+        evict_expect_user_sid(i, expect, sizeof(expect));
+        assert(sid_str_is(&p.copy.user, expect));
+        assert(p.copy.ngroups == 1);
+        evict_expect_group_sid(i, expect, sizeof(expect));
+        assert(sid_str_is(&p.copy.groups[0], expect));
+    }
+
+    /* Sweep back over every credential: each is either gone from the cache or
+     * still holds exactly what it resolved. */
+    for (i = 0; i < TEST_EVICT_N; i++) {
+        const struct chimera_vfs_cred_sids *sids;
+
+        chimera_vfs_cred_init_unix(&cred, TEST_EVICT_UID_BASE + i,
+                                   TEST_EVICT_GID_BASE + i, 0, NULL);
+
+        sids = chimera_vfs_cred_sids_lookup(thread, &cred);
+        if (!sids) {
+            continue;
+        }
+
+        cached++;
+        evict_expect_user_sid(i, expect, sizeof(expect));
+        assert(sid_str_is(&sids->user, expect));
+        assert(sids->ngroups == 1);
+        evict_expect_group_sid(i, expect, sizeof(expect));
+        assert(sid_str_is(&sids->groups[0], expect));
+    }
+
+    /* The sweep has to have overflowed the cache, or it proved nothing. */
+    assert(cached < TEST_EVICT_N);
+
+    fprintf(stderr, "  (cache kept %d of %d credentials)\n", cached,
+            TEST_EVICT_N);
+    TEST_PASS("an evicting cache never answers with another credential's SIDs");
+} /* test_eviction_keeps_entries_honest */
+
+/*
+ * The borrow pin.  A set handed to a callback must stay that caller's set for
+ * the whole callback, even if the callback resolves something else -- the shape
+ * a per-request funnel has when it warms every credential it sees.
+ *
+ * Without the pin the entry is quiescent while its own callback runs, so it is
+ * an eligible eviction victim; a nested cold resolve landing in the same full
+ * bucket repurposes it (intern() memsets it before it issues a single lookup,
+ * so the clobber does not even need the nested resolve to complete).  The
+ * borrowed set then changes identity under the callback's feet.
+ *
+ * Both routes that hand out a set are exercised: the fan-out join for a cold
+ * resolve, and the warm shortcut for an already-cached one.
+ */
+struct pin_probe {
+    struct chimera_vfs_thread *thread;
+    int                        index;      /* which credential is borrowed */
+    int                        nest_index; /* the one to resolve underneath */
+    int                        done;
+    int                        saw_set;
+};
+
+static int pin_mismatch;
+static int pin_nested_outstanding;
+
+static void
+pin_nested_cb(
+    const struct chimera_vfs_cred_sids *sids,
+    void                               *private_data)
+{
+    (void) sids;
+    (void) private_data;
+    pin_nested_outstanding--;
+} /* pin_nested_cb */
+
+static void
+pin_cb(
+    const struct chimera_vfs_cred_sids *sids,
+    void                               *private_data)
+{
+    struct pin_probe       *p = private_data;
+    struct chimera_vfs_cred nested;
+    char                    expect[CHIMERA_SID_STR_MAX];
+
+    p->done = 1;
+
+    if (!sids) {
+        return;
+    }
+    p->saw_set = 1;
+
+    /* Still holding the borrowed set, resolve an unrelated credential.  It is
+     * one nothing names, so it interns an entry (the eviction pressure this
+     * needs) and then parks. */
+    chimera_vfs_cred_init_unix(&nested,
+                               TEST_NEST_UID_BASE + p->nest_index,
+                               TEST_NEST_GID_BASE + p->nest_index, 0, NULL);
+    pin_nested_outstanding++;
+    chimera_vfs_cred_resolve_sids(p->thread, &nested, pin_nested_cb, NULL);
+
+    /* The pin must have held: this is still the set we were handed. */
+    evict_expect_user_sid(p->index, expect, sizeof(expect));
+    if (!sid_str_is(&sids->user, expect)) {
+        pin_mismatch++;
+    }
+} /* pin_cb */
+
+static void
+test_borrow_pinned_across_callback(
+    struct chimera_vfs_thread *thread,
+    struct evpl               *evpl)
+{
+    struct chimera_vfs_cred cred;
+    struct pin_probe        p;
+    int                     i, idx, cold_sets = 0, warm_sets = 0;
+
+    for (i = 0; i < TEST_PIN_N; i++) {
+        idx = TEST_PIN_FIRST + i;
+        chimera_vfs_cred_init_unix(&cred, TEST_EVICT_UID_BASE + idx,
+                                   TEST_EVICT_GID_BASE + idx, 0, NULL);
+
+        /* First resolve: cold, so the set arrives from the fan-out join. */
+        memset(&p, 0, sizeof(p));
+        p.thread     = thread;
+        p.index      = idx;
+        p.nest_index = 2 * i;
+        chimera_vfs_cred_resolve_sids(thread, &cred, pin_cb, &p);
+        while (!p.done) {
+            evpl_continue(evpl);
+        }
+        cold_sets += p.saw_set;
+
+        /* Second resolve: the entry is valid now, so the set arrives from the
+         * warm shortcut instead -- a different hand-out path, same rule. */
+        memset(&p, 0, sizeof(p));
+        p.thread     = thread;
+        p.index      = idx;
+        p.nest_index = 2 * i + 1;
+        chimera_vfs_cred_resolve_sids(thread, &cred, pin_cb, &p);
+        while (!p.done) {
+            evpl_continue(evpl);
+        }
+        warm_sets += p.saw_set;
+    }
+
+    /* Drain the nested resolves so nothing is left parked at teardown. */
+    while (pin_nested_outstanding > 0) {
+        evpl_continue(evpl);
+    }
+
+    assert(cold_sets == TEST_PIN_N);
+    assert(warm_sets == TEST_PIN_N);
+    assert(pin_mismatch == 0);
+
+    TEST_PASS("a borrowed set survives a resolve started from its own callback");
+} /* test_borrow_pinned_across_callback */
+
 int
 main(
     int    argc,
@@ -275,6 +537,8 @@ main(
     test_resolve_and_cache(vfs, thread, evpl);
     test_all_inline_completion(thread, evpl);
     test_warm_feeds_lookup(thread, evpl);
+    test_eviction_keeps_entries_honest(vfs, thread, evpl);
+    test_borrow_pinned_across_callback(thread, evpl);
 
     chimera_vfs_thread_destroy(thread);
     chimera_vfs_destroy(vfs);
