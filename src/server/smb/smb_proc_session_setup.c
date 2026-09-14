@@ -10,6 +10,7 @@
 #include "smb_wbclient.h"
 #include "smb_kerberos_identity.h"
 #include "vfs/vfs.h"
+#include "vfs/vfs_cred_sids.h"
 
 // Process NTLM authentication
 static int
@@ -98,6 +99,31 @@ chimera_smb_effective_signing_alg(
             return signing_alg;
     } /* switch */
 } /* chimera_smb_effective_signing_alg */
+
+/*
+ * Session setup has settled the caller's unix identity; take its native SIDs
+ * too, so an ACE carrying only a domain SID can be matched against this
+ * session.  The set is copied into the session because the resolver only lends
+ * it for the duration of this callback, and the session credential outlives
+ * every request that borrows it.
+ */
+static void
+chimera_smb_session_sids_cb(
+    const struct chimera_vfs_cred_sids *sids,
+    void                               *private_data)
+{
+    struct chimera_smb_session *session = private_data;
+
+    if (sids) {
+        session->cred_sids = *sids;
+        session->cred.sids = &session->cred_sids;
+    } else {
+        /* Nothing about this caller is nameable as a SID.  Leave cred.sids
+         * NULL: a SID-bearing ACE then matches nobody, which is the correct
+         * fail-closed default. */
+        session->cred.sids = NULL;
+    }
+} /* chimera_smb_session_sids_cb */
 
 void
 chimera_smb_session_setup(struct chimera_smb_request *request)
@@ -601,6 +627,11 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
          * identity.  Re-authentication does refresh the security context. */
         if (!is_binding) {
             chimera_vfs_cred_init_attr(&session->cred, uid, gid, ngids, gids);
+
+            chimera_vfs_cred_resolve_sids(
+                request->compound->thread->vfs_thread,
+                &session->cred,
+                chimera_smb_session_sids_cb, session);
         }
 
         /* SMB3 transport encryption: derive per-session keys from the raw

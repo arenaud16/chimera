@@ -425,6 +425,11 @@ struct chimera_smb_session {
 
     struct chimera_vfs_cred     cred;
 
+    /* Native SIDs describing this session's caller, pointed at by cred.sids.
+     * Owned here so it lives exactly as long as the credential does; the
+     * resolver's own copy is only borrowed for its callback. */
+    struct chimera_vfs_cred_sids cred_sids;
+
     /* Kerberos principal that ESTABLISHED the session, captured on the first
      * (authorizing) leg.  A multichannel bind over Kerberos compares the binding
      * connection's authenticated principal against this to enforce that the
