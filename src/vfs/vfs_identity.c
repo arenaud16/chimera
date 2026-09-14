@@ -14,11 +14,13 @@
  */
 
 #define _GNU_SOURCE
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <pwd.h>
 #include <grp.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "vfs.h"
@@ -46,6 +48,31 @@ struct chimera_vfs_identity_request {
     struct chimera_vfs_identity_result   result;
     chimera_vfs_identity_callback        callback;
     void                                *private_data;
+    /* Second link pair, so one job can sit on `queue` and on `inflight` at the
+     * same time.  `prev`/`next` above belong to whichever single list owns the
+     * job at that moment -- the queue, a job's waiters, or the origin thread's
+     * completion list. */
+    struct chimera_vfs_identity_request *inflight_prev;
+    struct chimera_vfs_identity_request *inflight_next;
+    /* Later resolves of the same key that joined this job; each is completed
+     * with a copy of this job's result. */
+    struct chimera_vfs_identity_request *waiters;
+};
+
+/* How long an unresolvable key stays remembered, and how many buckets the
+ * negative table has.  Short enough that a newly-created account resolves
+ * without a restart, long enough that a descriptor full of dead SIDs does not
+ * re-enter winbind on every access. */
+#define CHIMERA_VFS_IDENTITY_NEGATIVE_TTL     60
+#define CHIMERA_VFS_IDENTITY_NEGATIVE_BUCKETS 256
+
+struct chimera_vfs_identity_negative {
+    struct chimera_vfs_identity_negative *next;
+    enum chimera_vfs_identity_key         key;
+    uint32_t                              id;
+    time_t                                expiration;
+    char                                  name[CHIMERA_VFS_SID_MAX_LEN > 256 ?
+                                               CHIMERA_VFS_SID_MAX_LEN : 256];
 };
 
 struct chimera_vfs_identity {
@@ -55,6 +82,14 @@ struct chimera_vfs_identity {
     pthread_mutex_t                            lock;
     pthread_cond_t                             cond;
     struct chimera_vfs_identity_request       *queue;
+    /* Jobs handed to a worker and not yet completed, so a second resolve of
+     * the same key joins the one in flight instead of queueing a duplicate.
+     * Guarded by `lock`, like `queue`. */
+    struct chimera_vfs_identity_request       *inflight;
+    /* Keys the handlers could not resolve, remembered with a TTL.  Guarded by
+     * `lock`. */
+    struct chimera_vfs_identity_negative      *negative[
+        CHIMERA_VFS_IDENTITY_NEGATIVE_BUCKETS];
     int                                        shutdown;
     pthread_mutex_t                            handler_lock;
     struct chimera_vfs_identity_handler_entry *handlers;
@@ -218,11 +253,133 @@ chimera_vfs_identity_run_handlers(
     return rc;
 } /* chimera_vfs_identity_run_handlers */
 
+/* ---- key matching and the negative table -------------------------------- */
+
+/*
+ * Two identity requests name the same key.  The numeric keys compare on `id`
+ * and the string keys on `name`, because only one of the two is meaningful per
+ * key and comparing the other would split identical lookups.
+ */
+static int
+chimera_vfs_identity_key_eq(
+    enum chimera_vfs_identity_key key,
+    uint32_t                      id,
+    const char                   *name,
+    enum chimera_vfs_identity_key okey,
+    uint32_t                      oid,
+    const char                   *oname)
+{
+    if (key != okey) {
+        return 0;
+    }
+
+    if (key == CHIMERA_VFS_IDENTITY_BY_UID ||
+        key == CHIMERA_VFS_IDENTITY_BY_GID) {
+        return id == oid;
+    }
+
+    return name && oname && strcmp(name, oname) == 0;
+} /* chimera_vfs_identity_key_eq */
+
+static unsigned int
+chimera_vfs_identity_negative_hash(
+    enum chimera_vfs_identity_key key,
+    uint32_t                      id,
+    const char                   *name)
+{
+    unsigned int h = (unsigned int) key * 2654435761u;
+
+    if (key == CHIMERA_VFS_IDENTITY_BY_UID ||
+        key == CHIMERA_VFS_IDENTITY_BY_GID) {
+        h ^= id * 2654435761u;
+    } else if (name) {
+        for (const char *p = name; *p; p++) {
+            h = (h * 31u) + (unsigned char) *p;
+        }
+    }
+
+    return h % CHIMERA_VFS_IDENTITY_NEGATIVE_BUCKETS;
+} /* chimera_vfs_identity_negative_hash */
+
+/* Caller holds identity->lock.  Non-zero if this key is a live negative. */
+static int
+chimera_vfs_identity_negative_probe(
+    struct chimera_vfs_identity  *identity,
+    enum chimera_vfs_identity_key key,
+    uint32_t                      id,
+    const char                   *name)
+{
+    unsigned int                          b;
+    struct chimera_vfs_identity_negative *neg, **pp;
+    struct timespec                       now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    b  = chimera_vfs_identity_negative_hash(key, id, name);
+    pp = &identity->negative[b];
+
+    while (*pp) {
+        neg = *pp;
+
+        if (neg->expiration <= now.tv_sec) {
+            /* Expired: drop it as we walk, which keeps the table swept without
+             * a separate timer. */
+            *pp = neg->next;
+            free(neg);
+            continue;
+        }
+
+        if (chimera_vfs_identity_key_eq(key, id, name,
+                                        neg->key, neg->id, neg->name)) {
+            return 1;
+        }
+
+        pp = &neg->next;
+    }
+
+    return 0;
+} /* chimera_vfs_identity_negative_probe */
+
+/* Caller holds identity->lock. */
+static void
+chimera_vfs_identity_negative_add(
+    struct chimera_vfs_identity  *identity,
+    enum chimera_vfs_identity_key key,
+    uint32_t                      id,
+    const char                   *name)
+{
+    unsigned int                          b;
+    struct chimera_vfs_identity_negative *neg;
+    struct timespec                       now;
+
+    if (chimera_vfs_identity_negative_probe(identity, key, id, name)) {
+        return;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    neg             = calloc(1, sizeof(*neg));
+    neg->key        = key;
+    neg->id         = id;
+    neg->expiration = now.tv_sec + CHIMERA_VFS_IDENTITY_NEGATIVE_TTL;
+    if (name) {
+        /* snprintf, not strncpy: the caller hands us a fixed-size buffer, so
+         * gcc can see the copy might truncate and rejects strncpy under
+         * -Werror=stringop-truncation. */
+        snprintf(neg->name, sizeof(neg->name), "%s", name);
+    }
+
+    b                     = chimera_vfs_identity_negative_hash(key, id, name);
+    neg->next             = identity->negative[b];
+    identity->negative[b] = neg;
+} /* chimera_vfs_identity_negative_add */
+
 static void *
 chimera_vfs_identity_worker(void *arg)
 {
     struct chimera_vfs_identity         *identity = arg;
     struct chimera_vfs_identity_request *req;
+    struct chimera_vfs_identity_request *waiters, *waiter;
     struct chimera_vfs_thread           *origin;
 
     /* Pure writer: this worker only runs miss handlers and populates the cache
@@ -270,6 +427,42 @@ chimera_vfs_identity_worker(void *arg)
             }
         } else {
             req->found = 0;
+        }
+
+        pthread_mutex_lock(&identity->lock);
+
+        if (!req->found) {
+            chimera_vfs_identity_negative_add(identity, req->key, req->id,
+                                              req->name);
+        }
+
+        /* Leave the in-flight list and take the waiters in one critical
+         * section: after this the job is unreachable, so no resolve can join it
+         * once its result has stopped being handed out. */
+        DL_DELETE2(identity->inflight, req, inflight_prev, inflight_next);
+        waiters      = req->waiters;
+        req->waiters = NULL;
+
+        pthread_mutex_unlock(&identity->lock);
+
+        /* Fan the single result out to everyone who joined this job.  Each
+         * waiter resumes on its own origin thread, which is why the result is
+         * copied rather than shared -- and, like the hand-back below, the
+         * origin is read out of the waiter before the append publishes it. */
+        while (waiters) {
+            waiter = waiters;
+            DL_DELETE(waiters, waiter);
+
+            waiter->found  = req->found;
+            waiter->result = req->result;
+
+            origin = waiter->origin;
+
+            pthread_mutex_lock(&origin->lock);
+            DL_APPEND(origin->pending_identity, waiter);
+            pthread_mutex_unlock(&origin->lock);
+
+            evpl_ring_doorbell(&origin->doorbell);
         }
 
         /* Hand the completed job back to the originating evpl thread.
@@ -437,8 +630,9 @@ SYMBOL_EXPORT void
 chimera_vfs_identity_destroy(struct chimera_vfs_identity *identity)
 {
     struct chimera_vfs_identity_handler_entry *entry, *next;
-    struct chimera_vfs_identity_request       *req;
-    int                                        i;
+    struct chimera_vfs_identity_request       *req, *waiter;
+    struct chimera_vfs_identity_negative      *neg, *neg_next;
+    int                                        i, b;
 
     pthread_mutex_lock(&identity->lock);
     identity->shutdown = 1;
@@ -449,11 +643,31 @@ chimera_vfs_identity_destroy(struct chimera_vfs_identity *identity)
         pthread_join(identity->workers[i], NULL);
     }
 
-    /* Any jobs still queued at shutdown are dropped (their callers are gone). */
+    /* Any jobs still queued at shutdown are dropped (their callers are gone),
+     * and with them anything that joined them: a waiter is owned by the job it
+     * is parked on, so nothing else would ever free it. */
     while (identity->queue) {
         req = identity->queue;
         DL_DELETE(identity->queue, req);
+        DL_DELETE2(identity->inflight, req, inflight_prev, inflight_next);
+
+        while (req->waiters) {
+            waiter = req->waiters;
+            DL_DELETE(req->waiters, waiter);
+            free(waiter);
+        }
+
         free(req);
+    }
+
+    for (b = 0; b < CHIMERA_VFS_IDENTITY_NEGATIVE_BUCKETS; b++) {
+        neg = identity->negative[b];
+        while (neg) {
+            neg_next = neg->next;
+            free(neg);
+            neg = neg_next;
+        }
+        identity->negative[b] = NULL;
     }
 
     entry = identity->handlers;
@@ -492,6 +706,7 @@ chimera_vfs_identity_resolve(
     struct chimera_vfs_identity         *identity = thread->vfs->identity;
     struct chimera_vfs_identity_result   hit;
     struct chimera_vfs_identity_request *req;
+    struct chimera_vfs_identity_request *inflight;
 
     memset(&hit, 0, sizeof(hit));
 
@@ -515,7 +730,32 @@ chimera_vfs_identity_resolve(
     }
 
     pthread_mutex_lock(&identity->lock);
+
+    /* Remembered as unresolvable: answer now rather than re-entering a
+     * blocking miss handler.  A descriptor full of SIDs from a decommissioned
+     * domain would otherwise cost one winbind round trip per ACE per access. */
+    if (chimera_vfs_identity_negative_probe(identity, key, id, req->name)) {
+        pthread_mutex_unlock(&identity->lock);
+        free(req);
+        callback(NULL, private_data);
+        return;
+    }
+
+    /* Already being resolved: join that job.  Its completion fans the one
+     * result out to every waiter, on each waiter's own origin thread. */
+    DL_FOREACH2(identity->inflight, inflight, inflight_next)
+    {
+        if (chimera_vfs_identity_key_eq(key, id, req->name,
+                                        inflight->key, inflight->id,
+                                        inflight->name)) {
+            DL_APPEND(inflight->waiters, req);
+            pthread_mutex_unlock(&identity->lock);
+            return;
+        }
+    }
+
     DL_APPEND(identity->queue, req);
+    DL_APPEND2(identity->inflight, req, inflight_prev, inflight_next);
     pthread_cond_signal(&identity->cond);
     pthread_mutex_unlock(&identity->lock);
 } /* chimera_vfs_identity_resolve */

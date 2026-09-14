@@ -82,10 +82,12 @@ chimera_vfs_identity_register_handler(
     void                        *private_data);
 
 /*
- * Resolve an identity.  On a cache hit the callback fires inline before this
- * returns; on a miss it fires later on `thread`'s evpl loop.  `id` is used for
- * BY_UID/BY_GID; `name` (a NUL-terminated username or SID string) for
- * BY_NAME/BY_SID.
+ * Resolve an identity.  The callback fires inline before this returns on a
+ * cache hit, and on a key remembered as unresolvable (with a NULL result);
+ * otherwise it fires later on `thread`'s evpl loop, once a worker has run the
+ * miss handlers -- and a key already being resolved joins that job rather than
+ * starting a second one.  `id` is used for BY_UID/BY_GID; `name` (a
+ * NUL-terminated username or SID string) for BY_NAME/BY_SID.
  */
 void
 chimera_vfs_identity_resolve(

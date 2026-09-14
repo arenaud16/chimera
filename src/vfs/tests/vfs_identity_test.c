@@ -92,6 +92,108 @@ sid_bearing_handler(
     return -1;
 } /* sid_bearing_handler */
 
+/*
+ * Counts how often it was asked, and never resolves anything.  Lets the test
+ * assert that a repeated unresolvable key does NOT re-enter the handler (the
+ * negative cache answered), and that concurrent resolves of one key enter it
+ * exactly once (the in-flight join answered the rest).
+ */
+struct counting_handler_state {
+    int calls;
+};
+
+static int
+counting_handler(
+    enum chimera_vfs_identity_key       key,
+    uint32_t                            id,
+    const char                         *name,
+    struct chimera_vfs_identity_result *out,
+    void                               *private_data)
+{
+    struct counting_handler_state *st = private_data;
+
+    (void) key;
+    (void) id;
+    (void) name;
+    (void) out;
+
+    __sync_fetch_and_add(&st->calls, 1);
+    return -1;
+} /* counting_handler */
+
+/*
+ * An unresolvable key is cached as a negative: the second resolve completes
+ * with NULL without re-running the miss handlers.
+ *
+ * The state is static because a registered handler is never unregistered: the
+ * resolver keeps the pointer for the rest of the run, and a worker would reach
+ * through it again from the next test.
+ */
+static void
+test_negative_cache(
+    struct chimera_vfs        *vfs,
+    struct chimera_vfs_thread *thread,
+    struct evpl               *evpl)
+{
+    static struct counting_handler_state st = { .calls = 0 };
+    struct probe                         p1, p2;
+
+    chimera_vfs_identity_register_handler(vfs, counting_handler, &st);
+
+    memset(&p1, 0, sizeof(p1));
+    chimera_vfs_identity_resolve(thread, CHIMERA_VFS_IDENTITY_BY_SID, 0,
+                                 "S-1-5-21-999-999-999-4242", resolve_cb, &p1);
+    while (!p1.done) {
+        evpl_continue(evpl);
+    }
+    assert(!p1.found);
+    assert(st.calls == 1);
+
+    /* Second resolve of the same key: answered from the negative cache. */
+    memset(&p2, 0, sizeof(p2));
+    chimera_vfs_identity_resolve(thread, CHIMERA_VFS_IDENTITY_BY_SID, 0,
+                                 "S-1-5-21-999-999-999-4242", resolve_cb, &p2);
+    assert(p2.done);   /* fired inline, no park */
+    assert(!p2.found);
+    assert(st.calls == 1);
+
+    TEST_PASS("an unresolvable key is negatively cached and answered inline");
+} /* test_negative_cache */
+
+/*
+ * Two resolves of the same uncached key issued back to back run the miss
+ * handlers once; the second joins the in-flight job and both callbacks fire.
+ */
+static void
+test_inflight_dedup(
+    struct chimera_vfs        *vfs,
+    struct chimera_vfs_thread *thread,
+    struct evpl               *evpl)
+{
+    static struct counting_handler_state st = { .calls = 0 };
+    struct probe                         p1, p2;
+
+    chimera_vfs_identity_register_handler(vfs, counting_handler, &st);
+
+    memset(&p1, 0, sizeof(p1));
+    memset(&p2, 0, sizeof(p2));
+
+    chimera_vfs_identity_resolve(thread, CHIMERA_VFS_IDENTITY_BY_SID, 0,
+                                 "S-1-5-21-999-999-999-4243", resolve_cb, &p1);
+    chimera_vfs_identity_resolve(thread, CHIMERA_VFS_IDENTITY_BY_SID, 0,
+                                 "S-1-5-21-999-999-999-4243", resolve_cb, &p2);
+
+    while (!p1.done || !p2.done) {
+        evpl_continue(evpl);
+    }
+
+    assert(!p1.found);
+    assert(!p2.found);
+    assert(st.calls == 1);
+
+    TEST_PASS("concurrent resolves of one key run the miss handlers once");
+} /* test_inflight_dedup */
+
 int
 main(
     int    argc,
@@ -275,6 +377,10 @@ main(
     }
     assert(p.found == 0);
     TEST_PASS("unresolvable gid completes with no group");
+
+    /* --- 6. unresolvable keys are remembered, and duplicates coalesce --- */
+    test_negative_cache(vfs, thread, evpl);
+    test_inflight_dedup(vfs, thread, evpl);
 
     chimera_vfs_thread_destroy(thread);
     chimera_vfs_destroy(vfs);
