@@ -1042,6 +1042,17 @@ chimera_vfs_open_cache_set_doc(
     handle->doc_name_len        = name_len;
     handle->doc_cred            = *cred;
 
+    /* Drop the borrowed SID set.  cred->sids points into storage owned by
+     * whoever supplied the credential (an SMB session's cred_sids for every
+     * caller today), and the deferred unlink runs at last close -- which for a
+     * delete-on-close handle is routinely after that session has been released
+     * to the pool or freed outright, so the pointer would be dangling or,
+     * worse, aimed at the next occupant's identity.  The unlink has never
+     * matched SID ACEs (it authorizes on uid/gid like every other pre-SID
+     * path), so clearing it is both correct and free; a SID-only ACE simply
+     * matches nobody there, which is the fail-closed direction. */
+    handle->doc_cred.sids = NULL;
+
     if (parent_fh_len > 0) {
         memcpy(handle->doc_parent_fh, parent_fh, parent_fh_len);
     }

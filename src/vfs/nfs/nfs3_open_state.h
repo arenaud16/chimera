@@ -35,6 +35,14 @@ struct chimera_nfs3_open_state {
      * These are captured from the REMOVE request that triggered the silly rename,
      * NOT from the original open. They are used ONLY for the silly remove RPC
      * when the file is finally closed.
+     *
+     * This is a by-value copy, so it inherits the source credential's sids
+     * pointer -- a set borrowed from a VFS thread's credential-SID cache,
+     * which may be recycled long before this state is used.  That pointer is
+     * deliberately never dereferenced here: the credential is only ever fed to
+     * chimera_nfs_init_rpc2_cred(), which reads flavor, uid, gid and gids and
+     * nothing else.  Anything that starts matching SID ACEs off this
+     * credential must take its own copy of the set first.
      */
     struct chimera_vfs_cred silly_remove_cred;
 
@@ -45,6 +53,10 @@ struct chimera_nfs3_open_state {
      * opening credential (exactly what the Linux kernel client's open context
      * does) keeps a descriptor usable by the process that legitimately opened
      * it, regardless of who calls or what chmod happened since.
+     *
+     * Same borrowed-set caveat as silly_remove_cred above: the copied sids
+     * pointer is never dereferenced, because every consumer of this credential
+     * reaches it only through chimera_nfs_init_rpc2_cred().
      */
     int                     open_cred_valid;
     struct chimera_vfs_cred open_cred;
