@@ -439,8 +439,12 @@ struct chimera_smb_session {
      * anything, so a callback that outlives either event (a rapid re-auth on
      * the same session, or the session struct being handed to an unrelated
      * later session) finds a mismatch and writes nothing -- otherwise it
-     * could stamp a stale or foreign identity's SIDs onto this session. */
-    uint64_t                     cred_generation;
+     * could stamp a stale or foreign identity's SIDs onto this session.
+     *
+     * Atomic because the two sides genuinely run on different threads: a
+     * multichannel session is bound to connections on several, so a re-auth on
+     * one channel bumps this while a resolve callback on another reads it. */
+    _Atomic uint64_t             cred_generation;
 
     /* Kerberos principal that ESTABLISHED the session, captured on the first
      * (authorizing) leg.  A multichannel bind over Kerberos compares the binding

@@ -2169,7 +2169,7 @@ chimera_smb_session_alloc(struct chimera_server_smb_shared *shared)
      * whichever session last occupied it; bumping here means that callback's
      * captured generation can never match again, so it writes nothing into
      * this new occupant (see chimera_smb_session_sids_cb). */
-    session->cred_generation++;
+    atomic_fetch_add(&session->cred_generation, 1);
 
     pthread_mutex_unlock(&shared->sessions_lock);
 
@@ -2245,7 +2245,7 @@ chimera_smb_session_release(
          * only when (if ever) it is next handed out, so a SID resolve still
          * in flight for it cannot write into the struct while parked on
          * free_sessions either (see chimera_smb_session_sids_cb). */
-        session->cred_generation++;
+        atomic_fetch_add(&session->cred_generation, 1);
     }
 
     pthread_mutex_unlock(&shared->sessions_lock);

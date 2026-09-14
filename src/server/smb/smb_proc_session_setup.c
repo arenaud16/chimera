@@ -130,7 +130,7 @@ chimera_smb_session_sids_cb(
     struct chimera_smb_session_sids_ctx *ctx     = private_data;
     struct chimera_smb_session          *session = ctx->session;
 
-    if (session->cred_generation == ctx->generation) {
+    if (atomic_load(&session->cred_generation) == ctx->generation) {
         if (sids) {
             session->cred_sids = *sids;
             session->cred.sids = &session->cred_sids;
@@ -652,12 +652,15 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
 
             /* Bump before issuing the resolve: this identity (fresh auth or
              * re-auth) invalidates any earlier resolve still in flight for
-             * this session, so its callback finds a mismatch and skips. */
-            session->cred_generation++;
-
+             * this session, so its callback finds a mismatch and skips.  The
+             * bump and the stamp have to be the same operation -- this runs
+             * without sessions_lock, and on a multichannel session another
+             * channel may be bumping the same counter -- so take the value the
+             * increment itself produced rather than re-reading it. */
             sids_ctx             = malloc(sizeof(*sids_ctx));
             sids_ctx->session    = session;
-            sids_ctx->generation = session->cred_generation;
+            sids_ctx->generation = atomic_fetch_add(
+                &session->cred_generation, 1) + 1;
 
             chimera_vfs_cred_resolve_sids(
                 request->compound->thread->vfs_thread,
