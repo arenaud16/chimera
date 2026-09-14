@@ -76,6 +76,7 @@ chimera_vfs_get_server_cred(void)
         cred.uid    = getuid();
         cred.gid    = getgid();
         cred.ngids  = 0;
+        cred.sids   = NULL;
     }
     return &cred;
 } /* chimera_vfs_get_server_cred */
@@ -93,6 +94,7 @@ chimera_vfs_cred_init_unix(
     cred->gid    = gid;
     cred->origin = NULL;
     cred->flags  = 0;
+    cred->sids   = NULL;
 
     if (ngids > CHIMERA_VFS_CRED_MAX_GIDS) {
         ngids = CHIMERA_VFS_CRED_MAX_GIDS;
@@ -117,6 +119,7 @@ chimera_vfs_cred_init_attr(
     cred->gid    = gid;
     cred->origin = NULL;
     cred->flags  = 0;
+    cred->sids   = NULL;
 
     /* The caller's whole group set matters to the access decision, not just
      * its primary group: MS-DTYP 2.5.2 evaluates every group SID in the token,

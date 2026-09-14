@@ -35,6 +35,129 @@ mkcred(
     return c;
 } /* mkcred */
 
+/* Build a cred whose SID set contains one user SID and one group SID. */
+static void
+mkcred_sids(
+    struct chimera_vfs_cred_sids *sids,
+    const char                   *user_sid,
+    const char                   *group_sid)
+{
+    memset(sids, 0, sizeof(*sids));
+
+    if (user_sid) {
+        assert(chimera_sid_from_str(&sids->user, user_sid) == 0);
+    }
+    if (group_sid) {
+        assert(chimera_sid_from_str(&sids->groups[0], group_sid) == 0);
+        sids->ngroups = 1;
+    }
+} /* mkcred_sids */
+
+/*
+ * A DACL made only of native SID ACEs enforces against a caller whose SID set
+ * carries the matching SID, and matches nobody otherwise.  This is the whole
+ * point of the dual identity: the ACE never names a uid, so the match has to
+ * come from the caller's own SIDs.
+ */
+#define TEST_USER_SID  "S-1-5-21-111-222-333-1001"
+#define TEST_GROUP_SID "S-1-5-21-111-222-333-513"
+#define TEST_OTHER_SID "S-1-5-21-111-222-333-1002"
+
+static void
+test_opaque_sid_ace_enforces(void)
+{
+    ACL_BUF(acl, 4);
+    struct chimera_vfs_cred      named    = mkcred(1500, 1500);
+    struct chimera_vfs_cred      grpmbr   = mkcred(1501, 1501);
+    struct chimera_vfs_cred      stranger = mkcred(1502, 1502);
+    struct chimera_vfs_cred_sids named_sids, grp_sids, stranger_sids;
+    uint32_t                     g;
+
+    /* One ALLOW ACE naming a bare domain user SID, and nothing else. */
+    memset(acl_storage, 0, sizeof(acl_storage));
+    acl->num_aces            = 1;
+    acl->aces[0].type        = CHIMERA_ACE_ALLOWED;
+    acl->aces[0].flags       = 0;
+    acl->aces[0].access_mask = CHIMERA_ACE_READ_DATA | CHIMERA_ACE_WRITE_DATA;
+    acl->aces[0].who.type    = CHIMERA_PRINCIPAL_SID;
+    assert(chimera_sid_from_str(&acl->aces[0].who.sid, TEST_USER_SID) == 0);
+
+    /* The caller whose user SID the ACE names is granted. */
+    mkcred_sids(&named_sids, TEST_USER_SID, NULL);
+    named.sids = &named_sids;
+    g          = chimera_acl_access_check(acl, 0, 9999, 9999, &named,
+                                          CHIMERA_ACE_READ_DATA, 0);
+    assert(g == CHIMERA_ACE_READ_DATA);
+
+    /* A caller with no SID set at all matches nothing (today's behaviour). */
+    g = chimera_acl_access_check(acl, 0, 9999, 9999, &stranger,
+                                 CHIMERA_ACE_READ_DATA, 0);
+    assert(g == 0);
+
+    /* A caller whose SID set holds a different SID matches nothing. */
+    mkcred_sids(&stranger_sids, TEST_OTHER_SID, NULL);
+    stranger.sids = &stranger_sids;
+    g             = chimera_acl_access_check(acl, 0, 9999, 9999, &stranger,
+                                             CHIMERA_ACE_READ_DATA, 0);
+    assert(g == 0);
+
+    /* A group SID ACE matches a caller carrying that SID among its groups. */
+    acl->aces[0].who.type = CHIMERA_PRINCIPAL_SID;
+    memset(&acl->aces[0].who.sid, 0, sizeof(acl->aces[0].who.sid));
+    assert(chimera_sid_from_str(&acl->aces[0].who.sid, TEST_GROUP_SID) == 0);
+
+    mkcred_sids(&grp_sids, TEST_OTHER_SID, TEST_GROUP_SID);
+    grpmbr.sids = &grp_sids;
+    g           = chimera_acl_access_check(acl, 0, 9999, 9999, &grpmbr,
+                                           CHIMERA_ACE_READ_DATA, 0);
+    assert(g == CHIMERA_ACE_READ_DATA);
+
+    TEST_PASS("opaque SID ACEs enforce against the caller's SID set");
+} /* test_opaque_sid_ace_enforces */
+
+/*
+ * A DENY ACE naming a bare SID must deny, and an absent SID on either side
+ * must never match -- an all-zero chimera_sid is "no SID known", not a
+ * wildcard, so two identities that both lack a SID are not the same identity.
+ */
+static void
+test_opaque_sid_ace_denies(void)
+{
+    ACL_BUF(acl, 4);
+    struct chimera_vfs_cred      caller = mkcred(1500, 1500);
+    struct chimera_vfs_cred_sids caller_sids;
+    uint32_t                     g;
+
+    memset(acl_storage, 0, sizeof(acl_storage));
+    acl->num_aces            = 2;
+    acl->aces[0].type        = CHIMERA_ACE_DENIED;
+    acl->aces[0].access_mask = CHIMERA_ACE_WRITE_DATA;
+    acl->aces[0].who.type    = CHIMERA_PRINCIPAL_SID;
+    assert(chimera_sid_from_str(&acl->aces[0].who.sid, TEST_USER_SID) == 0);
+
+    acl->aces[1].type        = CHIMERA_ACE_ALLOWED;
+    acl->aces[1].access_mask = CHIMERA_ACE_READ_DATA | CHIMERA_ACE_WRITE_DATA;
+    acl->aces[1].who.type    = CHIMERA_PRINCIPAL_SPECIAL;
+    acl->aces[1].who.special = CHIMERA_WHO_EVERYONE;
+
+    mkcred_sids(&caller_sids, TEST_USER_SID, NULL);
+    caller.sids = &caller_sids;
+
+    /* DENY comes first and removes WRITE; the EVERYONE@ ALLOW still gives READ. */
+    g = chimera_acl_access_check(acl, 0, 9999, 9999, &caller,
+                                 CHIMERA_ACE_READ_DATA | CHIMERA_ACE_WRITE_DATA, 0);
+    assert(g == CHIMERA_ACE_READ_DATA);
+
+    /* An ACE whose SID is absent matches nobody, even a caller with no SIDs. */
+    memset(&acl->aces[0].who.sid, 0, sizeof(acl->aces[0].who.sid));
+    memset(&caller_sids, 0, sizeof(caller_sids));
+    g = chimera_acl_access_check(acl, 0, 9999, 9999, &caller,
+                                 CHIMERA_ACE_WRITE_DATA, 0);
+    assert(g == CHIMERA_ACE_WRITE_DATA);
+
+    TEST_PASS("opaque SID DENY applies; an absent SID is never a wildcard");
+} /* test_opaque_sid_ace_denies */
+
 /*
  * mode -> ACL -> mode must round-trip exactly for all 512 permission patterns.
  */
@@ -642,6 +765,8 @@ main(
     int    argc,
     char **argv)
 {
+    test_opaque_sid_ace_enforces();
+    test_opaque_sid_ace_denies();
     test_mode_roundtrip();
     test_cumulative_deny();
     test_null_acl_modecheck();

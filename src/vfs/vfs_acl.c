@@ -68,6 +68,37 @@ cred_in_group(
 } /* cred_in_group */
 
 /*
+ * Does `sid` name this caller?  True when it is the caller's own user SID or
+ * one of its group SIDs.  An absent SID on either side never matches: an
+ * all-zero chimera_sid means "no SID is known", not "any SID", so two
+ * identities that both lack one are not thereby the same identity.
+ */
+static int
+cred_matches_sid(
+    const struct chimera_vfs_cred *cred,
+    const struct chimera_sid      *sid)
+{
+    const struct chimera_vfs_cred_sids *sids = cred->sids;
+    uint32_t                            i;
+
+    if (!sids || !chimera_sid_present(sid)) {
+        return 0;
+    }
+
+    if (chimera_sid_equal(&sids->user, sid)) {
+        return 1;
+    }
+
+    for (i = 0; i < sids->ngroups; i++) {
+        if (chimera_sid_equal(&sids->groups[i], sid)) {
+            return 1;
+        }
+    }
+
+    return 0;
+} /* cred_matches_sid */
+
+/*
  * Does the principal in `ace` apply to the calling credential, given the file
  * owner/owning-group?
  */
@@ -117,9 +148,13 @@ ace_applies(
         case CHIMERA_PRINCIPAL_GROUP:
             return cred_in_group(cred, who->id);
         case CHIMERA_PRINCIPAL_SID:
-            /* An opaque native SID with no unix identity: preserved for
-             * round-tripping, but it can never describe a Unix caller. */
-            return 0;
+            /* A native Windows SID with no unix identity on the ACE.  It still
+             * describes a caller when the identity layer resolved that caller
+             * to the same SID -- which is how a descriptor written by another
+             * SMB stack, carrying only bare domain SIDs, enforces here.  A SID
+             * that names no caller we know matches nobody, which is the
+             * correct fail-closed default. */
+            return cred_matches_sid(cred, &who->sid);
         default:
             return 0;
     } /* switch */

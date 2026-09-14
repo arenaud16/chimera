@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <string.h>
 #include "vfs_attrs.h"
+#include "vfs_sid.h"
 
 /*
  * Maximum number of supplementary groups in VFS credentials.
@@ -33,6 +34,25 @@ enum chimera_vfs_cred_flavor {
 };
 
 /*
+ * The native SIDs that describe a caller: its own user SID, plus one per group
+ * it belongs to (its primary gid and every supplementary gid).  Resolved once
+ * per credential by the identity layer and attached to the credential by
+ * pointer, so an ACE carrying a bare Windows SID can be matched against the
+ * caller with a byte comparison instead of mapping the ACE back to a uid.
+ *
+ * A slot whose SID is absent (chimera_sid_present() is false) is a group or
+ * user the identity layer could not name; it is skipped when matching, never
+ * treated as a wildcard.  `ngroups` counts the populated entries of groups[],
+ * which holds the primary gid plus CHIMERA_VFS_CRED_MAX_GIDS supplementary
+ * ones.
+ */
+struct chimera_vfs_cred_sids {
+    uint32_t           ngroups;
+    struct chimera_sid user;
+    struct chimera_sid groups[CHIMERA_VFS_CRED_MAX_GIDS + 1];
+};
+
+/*
  * VFS credential structure.
  *
  * This is the generic credential representation used throughout
@@ -41,11 +61,11 @@ enum chimera_vfs_cred_flavor {
  * access control decisions.
  */
 struct chimera_vfs_cred {
-    enum chimera_vfs_cred_flavor flavor;
-    uint32_t                     uid;
-    uint32_t                     gid;
-    uint32_t                     ngids;
-    uint32_t                     gids[CHIMERA_VFS_CRED_MAX_GIDS];
+    enum chimera_vfs_cred_flavor        flavor;
+    uint32_t                            uid;
+    uint32_t                            gid;
+    uint32_t                            ngids;
+    uint32_t                            gids[CHIMERA_VFS_CRED_MAX_GIDS];
     /* Opaque identity of the protocol endpoint the operation arrived through
      * (the FUSE server stamps its mount here).  The synchronous notify gate
      * uses it to exempt the originator's own sync watches from a completion
@@ -53,11 +73,19 @@ struct chimera_vfs_cred {
      * blocking its reply on its own invalidation ack would deadlock inside
      * the kernel (the syscall holds the very lock the invalidation needs).
      * NULL everywhere else; not part of the credential identity hash. */
-    const void                  *origin;
+    const void                         *origin;
 
     /* Behavioral flags the protocol server stamps on the credential; like
      * origin, NOT part of the credential identity hash. */
-    uint32_t                     flags;
+    uint32_t                            flags;
+
+    /* Native SIDs describing this caller, or NULL when none were resolved.
+     * Owned by the layer that built the credential (the SMB session, or the
+     * VFS thread's credential-SID cache) and must outlive every request
+     * carrying a copy of this credential.  Like `origin` and `flags`, NOT part
+     * of the credential identity hash: it is a derived view of uid/gid/gids,
+     * so two credentials that hash equal describe the same SID set. */
+    const struct chimera_vfs_cred_sids *sids;
 };
 
 /* The caller is a stateless remote-filesystem client (the NFS server stamps
@@ -110,6 +138,7 @@ chimera_vfs_cred_init_anonymous(
     cred->gid    = anongid;
     cred->ngids  = 0;
     cred->origin = NULL;
+    cred->sids   = NULL;
 } // chimera_vfs_cred_init_anonymous
 
 /*

@@ -197,6 +197,7 @@ test_squash(void)
     memset(&exp, 0, sizeof(exp));
     exp.anonuid = 65534;
     exp.anongid = 65534;
+    cred.sids   = NULL;
 
     /* ROOT squash: uid 0 -> anon, with supplementary groups cleared. */
     exp.squash   = CHIMERA_NFS_SQUASH_ROOT;
