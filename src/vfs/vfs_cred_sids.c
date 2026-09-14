@@ -60,6 +60,23 @@ struct chimera_vfs_cred_sids_ctx {
     struct chimera_vfs_cred_sids_slot   slots[CHIMERA_VFS_CRED_MAX_GIDS + 2];
 };
 
+/*
+ * Supplementary gids of `cred` that are actually addressable.
+ *
+ * ngids is a plain uint32_t on an SDK struct, and gids[] is
+ * CHIMERA_VFS_CRED_MAX_GIDS long: an out-of-tree module that sets a larger
+ * count (no in-tree constructor does) would otherwise turn a read past the end
+ * of the caller's array into a write past the end of a cache entry's.  Clamp
+ * every walk of the array; the unclamped count is still what decides identity,
+ * so two credentials that differ only above the clamp stay distinct entries.
+ */
+static inline uint32_t
+chimera_vfs_cred_sids_ngids(const struct chimera_vfs_cred *cred)
+{
+    return cred->ngids > CHIMERA_VFS_CRED_MAX_GIDS ?
+           CHIMERA_VFS_CRED_MAX_GIDS : cred->ngids;
+} /* chimera_vfs_cred_sids_ngids */
+
 /* Does `entry` describe exactly `cred`?  Every field the hash mixes, compared
  * directly; only the first `ngids` supplementary gids are meaningful. */
 static int
@@ -75,7 +92,8 @@ chimera_vfs_cred_sids_key_eq(
     }
 
     return memcmp(entry->gids, cred->gids,
-                  cred->ngids * sizeof(cred->gids[0])) == 0;
+                  chimera_vfs_cred_sids_ngids(cred) *
+                  sizeof(cred->gids[0])) == 0;
 } /* chimera_vfs_cred_sids_key_eq */
 
 static void
@@ -89,7 +107,8 @@ chimera_vfs_cred_sids_set_key(
     entry->uid    = cred->uid;
     entry->gid    = cred->gid;
     entry->ngids  = cred->ngids;
-    memcpy(entry->gids, cred->gids, cred->ngids * sizeof(cred->gids[0]));
+    memcpy(entry->gids, cred->gids,
+           chimera_vfs_cred_sids_ngids(cred) * sizeof(cred->gids[0]));
 } /* chimera_vfs_cred_sids_set_key */
 
 /*
@@ -134,8 +153,10 @@ chimera_vfs_cred_sids_find(
 {
     struct chimera_vfs_cred_sids_entry *entry;
 
-    /* Nothing is ever interned for a credential-less (internal/server)
-     * operation, so there is nothing here to find for one either. */
+    /* A credential-less (internal/server) operation has no identity to
+     * resolve, so nothing is ever interned for one and there is nothing here
+     * to find either.  Every entry point in this file takes NULL the same way:
+     * no set, no crash (see chimera_vfs_cred_resolve_sids). */
     if (!cred || !thread->cred_sids) {
         return NULL;
     }
@@ -202,7 +223,11 @@ chimera_vfs_cred_sids_intern(
      * many trips round that loop, and other resolves start meanwhile.
      *
      * If every entry in the chain is held there is nothing to reuse, so the
-     * chain grows past the bound until they finish. */
+     * chain grows past the bound.  It does not shrink back: nothing outside
+     * chimera_vfs_cred_sids_thread_destroy() ever frees an entry, so a chain's
+     * high-water length is permanent for the life of the thread.  Entries past
+     * the bound are recycled like any other once their holders drop, so this
+     * costs memory, not correctness. */
     if (n >= CHIMERA_VFS_CRED_SIDS_CHAIN && victim) {
         keep = victim->next;
         memset(victim, 0, sizeof(*victim));
@@ -312,6 +337,16 @@ chimera_vfs_cred_resolve_sids(
     uint64_t                            hash;
     uint32_t                            i, nslots;
 
+    /* An operation with no credential (internal/server work, which the engine
+     * exempts from enforcement anyway) has nothing to resolve.  Answer it the
+     * way an unnameable caller is answered -- no set -- rather than faulting
+     * on it in chimera_vfs_cred_sids_intern(), so that NULL means the same
+     * thing at every entry point here. */
+    if (!cred) {
+        callback(NULL, private_data);
+        return;
+    }
+
     hash  = chimera_vfs_cred_hash(cred);
     entry = chimera_vfs_cred_sids_find(thread, cred, hash);
 
@@ -340,10 +375,7 @@ chimera_vfs_cred_resolve_sids(
         /* groups[] is the primary gid followed by the supplementary ones, in
          * the order the credential carries them, so a slot index maps straight
          * back to the gid it came from. */
-        entry->sids.ngroups = 1 + cred->ngids;
-        if (entry->sids.ngroups > CHIMERA_VFS_CRED_MAX_GIDS + 1) {
-            entry->sids.ngroups = CHIMERA_VFS_CRED_MAX_GIDS + 1;
-        }
+        entry->sids.ngroups = 1 + chimera_vfs_cred_sids_ngids(cred);
     }
 
     entry->inflight++;

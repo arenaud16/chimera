@@ -46,7 +46,9 @@ typedef void (*chimera_vfs_cred_sids_callback)(
  * Resolve `cred` to its SID set.  On a warm cache the callback fires inline,
  * before this returns; otherwise it fires later on `thread`'s evpl loop.
  * `sids` is NULL when nothing about the caller could be resolved, and is
- * pinned for the duration of the callback otherwise.
+ * pinned for the duration of the callback otherwise.  A NULL `cred` (an
+ * internal/server operation, which carries no identity) is answered the same
+ * way, inline, as is a NULL `cred` passed to any other entry point here.
  */
 void
 chimera_vfs_cred_resolve_sids(
