@@ -590,11 +590,14 @@ test_delete_allowed(void)
 
 /*
  * A CHIMERA_PRINCIPAL_SID ACE is an opaque native SID with no known unix id:
- * it is stored and marshalled verbatim but matches no caller during access
- * evaluation, exactly like a departed-user SID does on NTFS.
+ * it is stored and marshalled verbatim, but it matches no caller whose
+ * credential carries no resolved SID set -- mkcred() below builds exactly
+ * such a credential, since it never populates chimera_vfs_cred_sids.  A
+ * caller whose SID set does carry that SID matches instead; see
+ * test_opaque_sid_ace_enforces for that case.
  */
 static void
-test_sid_principal_never_matches(void)
+test_sid_principal_no_sid_set_never_matches(void)
 {
     ACL_BUF(acl, 2);
     struct chimera_vfs_cred u = mkcred(1000, 2000);
@@ -620,8 +623,8 @@ test_sid_principal_never_matches(void)
     /* It does not bear on the POSIX mode projection either. */
     assert(chimera_acl_to_mode(acl) == 0);
 
-    TEST_PASS("CHIMERA_PRINCIPAL_SID ACE matches no caller and no mode class");
-} /* test_sid_principal_never_matches */
+    TEST_PASS("CHIMERA_PRINCIPAL_SID ACE matches no SID-less caller, and no mode class");
+} /* test_sid_principal_no_sid_set_never_matches */
 
 /*
  * chmod preserves a SID-bearing named ACE with its SID intact, and
@@ -778,7 +781,7 @@ main(
     test_serialize_roundtrip();
     test_gate();
     test_delete_allowed();
-    test_sid_principal_never_matches();
+    test_sid_principal_no_sid_set_never_matches();
     test_sid_survives_chmod_and_inherit();
     test_serialize_bogus_sid_len();
 

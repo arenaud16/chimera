@@ -92,8 +92,11 @@ enum chimera_principal_type {
     CHIMERA_PRINCIPAL_SPECIAL = 2, /* special-who below                      */
     /* A native Windows SID the identity layer could not map to a uid or gid.
      * It is stored and marshalled verbatim so the ACE round-trips losslessly
-     * (as NTFS keeps an ACE for a departed domain user), but it matches no
-     * caller during access evaluation and bears on no POSIX mode class. */
+     * (as NTFS keeps an ACE for a departed domain user).  During access
+     * evaluation it is matched against the caller's own resolved SIDs (see
+     * chimera_vfs_cred_sids), so a descriptor carrying only bare domain SIDs
+     * still enforces; a SID that names no caller we know matches nobody, and
+     * it bears on no POSIX mode class either way. */
     CHIMERA_PRINCIPAL_SID     = 3,
 };
 
