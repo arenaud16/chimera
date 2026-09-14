@@ -2165,6 +2165,12 @@ chimera_smb_session_alloc(struct chimera_server_smb_shared *shared)
     session->refcnt       = 1;
     session->num_channels = 0;
 
+    /* A pooled session struct may still have a SID resolve in flight for
+     * whichever session last occupied it; bumping here means that callback's
+     * captured generation can never match again, so it writes nothing into
+     * this new occupant (see chimera_smb_session_sids_cb). */
+    session->cred_generation++;
+
     pthread_mutex_unlock(&shared->sessions_lock);
 
 
@@ -2233,6 +2239,13 @@ chimera_smb_session_release(
         if (session->flags & CHIMERA_SMB_SESSION_AUTHORIZED) {
             HASH_DEL(shared->sessions, session);
         }
+
+        /* Belt-and-suspenders alongside the bump in chimera_smb_session_alloc:
+         * invalidate this session's identity the moment it is retired, not
+         * only when (if ever) it is next handed out, so a SID resolve still
+         * in flight for it cannot write into the struct while parked on
+         * free_sessions either (see chimera_smb_session_sids_cb). */
+        session->cred_generation++;
     }
 
     pthread_mutex_unlock(&shared->sessions_lock);

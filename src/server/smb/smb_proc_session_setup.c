@@ -100,29 +100,49 @@ chimera_smb_effective_signing_alg(
     } /* switch */
 } /* chimera_smb_effective_signing_alg */
 
+/* Pins the session together with the generation stamp captured when its SID
+* resolve was issued (see chimera_smb_session_sids_cb below).  Heap-allocated
+* because the resolve may complete after this session-setup call returns. */
+struct chimera_smb_session_sids_ctx {
+    struct chimera_smb_session *session;
+    uint64_t                    generation;
+};
+
 /*
  * Session setup has settled the caller's unix identity; take its native SIDs
  * too, so an ACE carrying only a domain SID can be matched against this
  * session.  The set is copied into the session because the resolver only lends
  * it for the duration of this callback, and the session credential outlives
  * every request that borrows it.
+ *
+ * The session struct is pooled (chimera_smb_session_alloc/_release), and its
+ * cred_generation is bumped both on every (re-)authentication and whenever the
+ * struct is recycled for a new session.  This callback only writes if its
+ * captured generation still matches: otherwise either a faster re-auth on the
+ * same session, or the struct having since been handed to an unrelated later
+ * session, would let a stale or foreign identity's SIDs land here.
  */
 static void
 chimera_smb_session_sids_cb(
     const struct chimera_vfs_cred_sids *sids,
     void                               *private_data)
 {
-    struct chimera_smb_session *session = private_data;
+    struct chimera_smb_session_sids_ctx *ctx     = private_data;
+    struct chimera_smb_session          *session = ctx->session;
 
-    if (sids) {
-        session->cred_sids = *sids;
-        session->cred.sids = &session->cred_sids;
-    } else {
-        /* Nothing about this caller is nameable as a SID.  Leave cred.sids
-         * NULL: a SID-bearing ACE then matches nobody, which is the correct
-         * fail-closed default. */
-        session->cred.sids = NULL;
+    if (session->cred_generation == ctx->generation) {
+        if (sids) {
+            session->cred_sids = *sids;
+            session->cred.sids = &session->cred_sids;
+        } else {
+            /* Nothing about this caller is nameable as a SID.  Leave cred.sids
+             * NULL: a SID-bearing ACE then matches nobody, which is the correct
+             * fail-closed default. */
+            session->cred.sids = NULL;
+        }
     }
+
+    free(ctx);
 } /* chimera_smb_session_sids_cb */
 
 void
@@ -626,12 +646,23 @@ chimera_smb_session_setup(struct chimera_smb_request *request)
          * session owner, and overwriting here would let a bind move the owning
          * identity.  Re-authentication does refresh the security context. */
         if (!is_binding) {
+            struct chimera_smb_session_sids_ctx *sids_ctx;
+
             chimera_vfs_cred_init_attr(&session->cred, uid, gid, ngids, gids);
+
+            /* Bump before issuing the resolve: this identity (fresh auth or
+             * re-auth) invalidates any earlier resolve still in flight for
+             * this session, so its callback finds a mismatch and skips. */
+            session->cred_generation++;
+
+            sids_ctx             = malloc(sizeof(*sids_ctx));
+            sids_ctx->session    = session;
+            sids_ctx->generation = session->cred_generation;
 
             chimera_vfs_cred_resolve_sids(
                 request->compound->thread->vfs_thread,
                 &session->cred,
-                chimera_smb_session_sids_cb, session);
+                chimera_smb_session_sids_cb, sids_ctx);
         }
 
         /* SMB3 transport encryption: derive per-session keys from the raw

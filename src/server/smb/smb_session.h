@@ -360,7 +360,7 @@ struct chimera_smb_tree {
 #define SMB2_MAX_CHANNELS                32
 
 struct chimera_smb_session {
-    uint64_t                    session_id;
+    uint64_t                     session_id;
     /* Stable per-CLIENT identity used as the owner key for cache claims,
      * SHARE reservations and byte-range locks (chimera_claim_owner.client_key).
      * Derived from the connection's ClientGuid, NOT the session id, because
@@ -369,18 +369,18 @@ struct chimera_smb_session {
      * lease namespace and must coalesce/upgrade rather than conflict.  Falls
      * back to session_id for guid-less clients (pre-3.0 dialects send a zero
      * ClientGuid) so distinct legacy clients are not collapsed onto one key. */
-    uint64_t                    client_key;
-    uint32_t                    refcnt;
-    uint32_t                    flags;
+    uint64_t                     client_key;
+    uint32_t                     refcnt;
+    uint32_t                     flags;
     /* Dialect of the connection this session was established on (MS-SMB2
      * Session.Connection.Dialect).  A PreviousSessionId reconnect whose
      * connection negotiated a different dialect is rejected. */
-    uint16_t                    dialect;
+    uint16_t                     dialect;
     /* Session.SupportsNotifications (MS-SMB2 3.3.5.5): copied from
      * Connection.SupportsNotifications on the SESSION_SETUP that first
      * authorized the session.  A later binding SESSION_SETUP on a connection
      * whose SupportsNotifications differs is rejected (3.1.1 only). */
-    uint8_t                     supports_notifications;
+    uint8_t                      supports_notifications;
     /* Signing algorithm (SMB2_SIGNING_*) negotiated on the connection the
      * session was established on.  A SESSION_SETUP response the client
      * verifies against Session.SigningKey (binding interim/error legs and
@@ -389,53 +389,65 @@ struct chimera_smb_session {
      * client's session signing-key object carries the algorithm of the
      * establishing connection (smbtorture smb2.session.bind_negative_smb3to2*,
      * Samba bug 14512). */
-    uint16_t                    sign_alg;
+    uint16_t                     sign_alg;
     /* Cipher (SMB2_ENCRYPTION_*) negotiated on the establishing connection,
      * recorded whether or not encryption is active.  A binding connection
      * whose negotiated cipher differs is rejected with
      * STATUS_INVALID_PARAMETER (MS-SMB2 3.3.5.5). */
-    uint16_t                    conn_cipher_id;
-    struct UT_hash_handle       hh;
-    struct chimera_smb_session *prev;
-    struct chimera_smb_session *next;
+    uint16_t                     conn_cipher_id;
+    struct UT_hash_handle        hh;
+    struct chimera_smb_session  *prev;
+    struct chimera_smb_session  *next;
 
-    pthread_mutex_t             lock;
-    struct chimera_smb_tree   **trees;
+    pthread_mutex_t              lock;
+    struct chimera_smb_tree    **trees;
 
-    int                         max_trees;
-    uint8_t                     signing_key[16];
+    int                          max_trees;
+    uint8_t                      signing_key[16];
 
     /* Number of channels (connections) bound to this session, including the
      * primary.  Bounded at SMB2_MAX_CHANNELS so a client cannot bind an
      * unlimited number of channels (MS-SMB2 §3.3.5.5.3 returns
      * STATUS_INSUFFICIENT_RESOURCES once the server's limit is reached).
      * Guarded by shared->sessions_lock. */
-    int                         num_channels;
+    int                          num_channels;
 
     /* SMB3 transport encryption (set when CHIMERA_SMB_SESSION_ENCRYPT_DATA).
      * enc_key encrypts server->client responses; dec_key decrypts
      * client->server requests.  enc_nonce_counter is the server's strictly
      * monotonic per-session message counter (never reused for a key — GCM nonce
      * reuse is catastrophic), shared across all channels of the session. */
-    uint8_t                     enc_key[32];
-    uint8_t                     dec_key[32];
-    size_t                      enc_key_len;
-    uint16_t                    cipher_id;
-    _Atomic uint64_t            enc_nonce_counter;
+    uint8_t                      enc_key[32];
+    uint8_t                      dec_key[32];
+    size_t                       enc_key_len;
+    uint16_t                     cipher_id;
+    _Atomic uint64_t             enc_nonce_counter;
 
-    struct chimera_vfs_cred     cred;
+    struct chimera_vfs_cred      cred;
 
     /* Native SIDs describing this session's caller, pointed at by cred.sids.
      * Owned here so it lives exactly as long as the credential does; the
      * resolver's own copy is only borrowed for its callback. */
     struct chimera_vfs_cred_sids cred_sids;
 
+    /* Monotonic stamp bumped whenever this session's credential identity
+     * changes hands: on every (re-)authentication that calls
+     * chimera_vfs_cred_init_attr, and whenever the session struct itself is
+     * recycled from the pool for a new session (chimera_smb_session_alloc/
+     * _release).  A SID resolve callback captures this value when it is
+     * issued and compares it against the current value before writing
+     * anything, so a callback that outlives either event (a rapid re-auth on
+     * the same session, or the session struct being handed to an unrelated
+     * later session) finds a mismatch and writes nothing -- otherwise it
+     * could stamp a stale or foreign identity's SIDs onto this session. */
+    uint64_t                     cred_generation;
+
     /* Kerberos principal that ESTABLISHED the session, captured on the first
      * (authorizing) leg.  A multichannel bind over Kerberos compares the binding
      * connection's authenticated principal against this to enforce that the
      * binding user is the session owner (MS-SMB2 3.3.5.5.3); empty for an
      * NTLM-established session (which is matched by uid instead). */
-    char                        principal[256];
+    char                         principal[256];
 };
 
 /* Derive the stable per-client lease owner key from a 16-byte ClientGuid.
