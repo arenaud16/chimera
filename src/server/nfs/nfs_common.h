@@ -694,6 +694,7 @@ chimera_nfs_map_cred_req(
     const struct evpl_rpc2_cred *rpc_cred)
 {
     const struct chimera_vfs_cred_sids *sids;
+    int                                 cached;
 
     chimera_nfs_map_cred(&req->cred, rpc_cred);
 
@@ -705,20 +706,30 @@ chimera_nfs_map_cred_req(
      * unseen caller's first request is evaluated with no SID set -- today's
      * behavior, and fail-closed -- and every request after it is enforced.
      *
-     * chimera_vfs_cred_sids_lookup() hands back a set borrowed from the
-     * thread's cache, valid only until this thread's next resolve or warm --
-     * a later request on the same thread could evict it out from under
-     * req->cred.sids.  Copy it into the request's own cred_sids (pooled with
-     * the request, so the cost is amortized over the pool high-water mark
-     * rather than paid per operation) and point at that instead of the
-     * borrowed entry.
+     * The probe reports whether the cache has an answer separately from
+     * whether that answer names anything.  Warming only when it has neither
+     * matters: a deployment with no SID source at all (NSS never supplies one)
+     * resolves every caller to the empty set, and treating that as a miss
+     * would pay a 1 + ngids identity fan-out on every single request forever.
+     *
+     * A set from the probe is borrowed from the thread's cache and valid only
+     * until this thread's next resolve or warm -- a later request on the same
+     * thread could evict it out from under req->cred.sids.  Copy it into the
+     * request's own cred_sids (pooled with the request, so the cost is
+     * amortized over the pool high-water mark rather than paid per operation)
+     * and point at that instead of the borrowed entry.
      */
-    sids = chimera_vfs_cred_sids_lookup(req->thread->vfs_thread, &req->cred);
+    cached = chimera_vfs_cred_sids_probe(req->thread->vfs_thread, &req->cred,
+                                         &sids);
 
+    /* Copy before warming: a resolve started underneath us may recycle the
+     * entry the borrowed set lives in. */
     if (sids) {
         req->cred_sids = *sids;
         req->cred.sids = &req->cred_sids;
-    } else {
+    }
+
+    if (!cached) {
         chimera_vfs_cred_sids_warm(req->thread->vfs_thread, &req->cred);
     }
 

@@ -11,6 +11,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #undef NDEBUG
 #include <assert.h>
 
@@ -33,6 +34,13 @@
 #define TEST_UID_SID      "S-1-5-21-11-22-33-1100"
 #define TEST_GID_SID      "S-1-5-21-11-22-33-1200"
 #define TEST_SUPP_GID_SID "S-1-5-21-11-22-33-1201"
+
+/* The credential used by the expiry test: its gid is nameable from the start,
+ * its uid only once the test teaches the identity layer about it. */
+#define TEST_HEAL_UID     5100
+#define TEST_HEAL_GID     5200
+#define TEST_HEAL_UID_SID "S-1-5-21-11-22-33-1500"
+#define TEST_HEAL_GID_SID "S-1-5-21-11-22-33-1600"
 
 struct sids_probe {
     int                          done;
@@ -236,6 +244,173 @@ test_warm_feeds_lookup(
 
     TEST_PASS("warm leaves the set where a synchronous lookup finds it");
 } /* test_warm_feeds_lookup */
+
+/*
+ * "Resolved to nothing" is an answer, and the cache has to be able to say so.
+ *
+ * A credential nothing names produces an empty set, which is reported as no
+ * set at all -- correct, but indistinguishable from "never resolved" if that
+ * is all the cache can report.  A caller that cannot park (the NFS
+ * per-request funnel) would then start a fresh 1 + ngids fan-out on every
+ * single request, forever, on any deployment without a SID source.  The probe
+ * reports the two facts separately.
+ */
+static void
+test_probe_distinguishes_empty_from_unseen(
+    struct chimera_vfs_thread *thread,
+    struct evpl               *evpl)
+{
+    struct chimera_vfs_cred             cred;
+    struct sids_probe                   p;
+    const struct chimera_vfs_cred_sids *sids;
+
+    chimera_vfs_cred_init_unix(&cred, 4997, 4997, 0, NULL);
+
+    /* Unseen: nothing cached, nothing on the way, so the caller should ask. */
+    assert(chimera_vfs_cred_sids_probe(thread, &cred, &sids) == 0);
+    assert(sids == NULL);
+
+    memset(&p, 0, sizeof(p));
+    chimera_vfs_cred_resolve_sids(thread, &cred, sids_cb, &p);
+
+    if (!p.done) {
+        /* Parked.  A resolve on its way counts as an answer coming, so a
+         * per-request caller must not stack another fan-out on top of it. */
+        assert(chimera_vfs_cred_sids_probe(thread, &cred, &sids) != 0);
+        assert(sids == NULL);
+    }
+
+    while (!p.done) {
+        evpl_continue(evpl);
+    }
+    assert(!p.have);
+
+    /* Recorded: there is nothing to hand out, and nothing left to ask. */
+    assert(chimera_vfs_cred_sids_probe(thread, &cred, &sids) != 0);
+    assert(sids == NULL);
+    assert(chimera_vfs_cred_sids_lookup(thread, &cred) == NULL);
+
+    TEST_PASS("the probe tells a resolved-empty credential from an unseen one");
+} /* test_probe_distinguishes_empty_from_unseen */
+
+/* Names the heal credential's gid; its uid is refused until the test adds it
+ * to the identity layer's user cache. */
+static int
+heal_handler(
+    enum chimera_vfs_identity_key       key,
+    uint32_t                            id,
+    const char                         *name,
+    struct chimera_vfs_identity_result *out,
+    void                               *private_data)
+{
+    (void) name;
+    (void) private_data;
+
+    if (key == CHIMERA_VFS_IDENTITY_BY_GID && id == TEST_HEAL_GID) {
+        out->is_group  = 1;
+        out->group.gid = TEST_HEAL_GID;
+        snprintf(out->group.groupname, sizeof(out->group.groupname), "healgrp");
+        out->group.groupname_len = (int) strlen(out->group.groupname);
+        snprintf(out->group.sid, sizeof(out->group.sid), TEST_HEAL_GID_SID);
+        return 0;
+    }
+
+    return -1;
+} /* heal_handler */
+
+static void
+test_sleep_past_ttl(void)
+{
+    struct timespec ts = { .tv_sec = 1, .tv_nsec = 300000000 };
+
+    nanosleep(&ts, NULL);
+} /* test_sleep_past_ttl */
+
+/*
+ * Expiry.
+ *
+ * A resolve that comes back partial -- one group the identity layer could not
+ * name in that moment, which its negative cache then remembers for a while --
+ * used to be the answer for the life of the VFS thread: a valid entry was
+ * never re-resolved and never aged out, so the caller silently lost every
+ * access that group SID grants.  A completed resolve is therefore trusted only
+ * for a TTL, after which the next resolve rebuilds it.
+ *
+ * Expiry is a refresh trigger, not an invalidation: the old set keeps being
+ * handed out until the replacement lands, because withholding it would leave
+ * the caller unenforced (on the NFS funnel, denied) for the length of the
+ * refresh, once per TTL.
+ */
+static void
+test_expiry_refreshes_a_partial_set(
+    struct chimera_vfs        *vfs,
+    struct chimera_vfs_thread *thread,
+    struct evpl               *evpl)
+{
+    struct chimera_vfs_cred             cred;
+    struct sids_probe                   p;
+    const struct chimera_vfs_cred_sids *sids;
+
+    chimera_vfs_identity_register_handler(vfs, heal_handler, NULL);
+
+    /* A minute is a long time to hold a test up for. */
+    chimera_vfs_cred_sids_set_ttl(thread, 1);
+
+    chimera_vfs_cred_init_unix(&cred, TEST_HEAL_UID, TEST_HEAL_GID, 0, NULL);
+
+    /* Partial: the group is named, the user is not. */
+    memset(&p, 0, sizeof(p));
+    chimera_vfs_cred_resolve_sids(thread, &cred, sids_cb, &p);
+    while (!p.done) {
+        evpl_continue(evpl);
+    }
+    assert(p.have);
+    assert(!chimera_sid_present(&p.copy.user));
+    assert(sid_str_is(&p.copy.groups[0], TEST_HEAL_GID_SID));
+
+    /* Teach the identity layer the user it could not name.  The user cache is
+     * consulted ahead of the negative table, so this is enough to make the
+     * next resolve of that uid succeed. */
+    assert(chimera_vfs_add_user(vfs, "healuser", NULL, NULL, TEST_HEAL_UID_SID,
+                                TEST_HEAL_UID, TEST_HEAL_GID, 0, NULL, 0) == 0);
+
+    /* Still inside the TTL: the entry stands, and is handed straight back
+     * without re-resolving anything. */
+    memset(&p, 0, sizeof(p));
+    chimera_vfs_cred_resolve_sids(thread, &cred, sids_cb, &p);
+    assert(p.done);
+    assert(p.have);
+    assert(!chimera_sid_present(&p.copy.user));
+
+    test_sleep_past_ttl();
+
+    /* Expired.  The probe now tells its caller to resolve again -- and still
+     * hands back the last answer, so a per-request caller is not left without
+     * one while the refresh runs. */
+    assert(chimera_vfs_cred_sids_probe(thread, &cred, &sids) == 0);
+    assert(sids != NULL);
+    assert(!chimera_sid_present(&sids->user));
+    assert(sid_str_is(&sids->groups[0], TEST_HEAL_GID_SID));
+
+    /* And the refresh heals the set. */
+    memset(&p, 0, sizeof(p));
+    chimera_vfs_cred_resolve_sids(thread, &cred, sids_cb, &p);
+    while (!p.done) {
+        evpl_continue(evpl);
+    }
+    assert(p.have);
+    assert(sid_str_is(&p.copy.user, TEST_HEAL_UID_SID));
+    assert(sid_str_is(&p.copy.groups[0], TEST_HEAL_GID_SID));
+
+    assert(chimera_vfs_cred_sids_probe(thread, &cred, &sids) != 0);
+    assert(sids != NULL);
+    assert(sid_str_is(&sids->user, TEST_HEAL_UID_SID));
+
+    /* Back to the shipped default for anything that runs after this. */
+    chimera_vfs_cred_sids_set_ttl(thread, 60);
+
+    TEST_PASS("an expired entry is re-resolved, and served until it is");
+} /* test_expiry_refreshes_a_partial_set */
 
 /*
  * Eviction.  The cache is a fixed number of buckets with a bounded chain each,
@@ -552,6 +727,8 @@ main(
     test_resolve_and_cache(vfs, thread, evpl);
     test_all_inline_completion(thread, evpl);
     test_warm_feeds_lookup(thread, evpl);
+    test_probe_distinguishes_empty_from_unseen(thread, evpl);
+    test_expiry_refreshes_a_partial_set(vfs, thread, evpl);
     test_eviction_keeps_entries_honest(vfs, thread, evpl);
     test_borrow_pinned_across_callback(thread, evpl);
 

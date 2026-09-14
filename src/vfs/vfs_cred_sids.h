@@ -26,7 +26,8 @@
  *     duration of that callback.  It stays valid even if the callback resolves
  *     another credential, so it is always safe to read and to copy there.
  *
- *   - A set returned by chimera_vfs_cred_sids_lookup() is pinned by nothing.
+ *   - A set returned by chimera_vfs_cred_sids_probe() (or its
+ *     chimera_vfs_cred_sids_lookup() shorthand) is pinned by nothing.
  *     It is valid only until this thread next calls
  *     chimera_vfs_cred_resolve_sids() or chimera_vfs_cred_sids_warm(), and
  *     never past the current trip through the event loop.
@@ -58,12 +59,39 @@ chimera_vfs_cred_resolve_sids(
     void                          *private_data);
 
 /*
- * Synchronous probe: the cached SID set for `cred` on this thread, or NULL.
- * Never resolves and never blocks, so it is safe on a path that cannot park
- * (the per-request NFS credential funnel, a readdir entry callback).
+ * Synchronous probe for a path that cannot park (the per-request NFS
+ * credential funnel, a readdir entry callback).  Never resolves and never
+ * blocks.
+ *
+ * Reports two things, because a caller needs both:
+ *
+ *   - the return value is non-zero when this thread already has an answer for
+ *     `cred`, or has one on the way, so there is no point starting a resolve.
+ *     Zero means nobody has asked lately: the caller proceeds with what it has
+ *     and warms the cache for its next request.
+ *
+ *   - `*sids` is the cached set, or NULL when the credential resolved to no
+ *     native identity at all -- the ordinary case on a deployment with no SID
+ *     source, where a resolve completes, names nothing, and must not be
+ *     retried for every subsequent request.
+ *
+ * A set whose TTL has run out is still handed back while its replacement is
+ * being resolved; expiry triggers a refresh rather than an invalidation, so a
+ * caller is never transiently unresolved (and, on a path that proceeds on a
+ * miss, transiently denied) just because the clock rolled over.
  *
  * The result is unpinned -- see the borrow rules above.  Use it, or copy it,
  * before starting another resolve on this thread.
+ */
+int
+chimera_vfs_cred_sids_probe(
+    struct chimera_vfs_thread           *thread,
+    const struct chimera_vfs_cred       *cred,
+    const struct chimera_vfs_cred_sids **sids);
+
+/*
+ * The set half of chimera_vfs_cred_sids_probe(), for callers that only want to
+ * read what is cached and have nothing to warm.
  */
 const struct chimera_vfs_cred_sids *
 chimera_vfs_cred_sids_lookup(
@@ -80,6 +108,18 @@ void
 chimera_vfs_cred_sids_warm(
     struct chimera_vfs_thread     *thread,
     const struct chimera_vfs_cred *cred);
+
+/*
+ * Override how long this thread trusts a completed resolve, in seconds.
+ *
+ * The default is a minute, matching the identity caches underneath (see
+ * CHIMERA_VFS_CRED_SIDS_TTL).  The server leaves it alone; this exists so the
+ * unit test can exercise expiry and re-resolution without waiting one.
+ */
+void
+chimera_vfs_cred_sids_set_ttl(
+    struct chimera_vfs_thread *thread,
+    uint32_t                   seconds);
 
 /* Free a thread's credential-SID cache (called from VFS thread teardown). */
 void

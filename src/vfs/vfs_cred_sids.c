@@ -4,6 +4,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "vfs.h"
 #include "vfs_internal.h"
@@ -18,10 +19,38 @@
 #define CHIMERA_VFS_CRED_SIDS_BUCKETS 64
 #define CHIMERA_VFS_CRED_SIDS_CHAIN   4
 
+/*
+ * How long a completed resolve is trusted, in seconds.
+ *
+ * This cache is layered over two that already expire: chimera_vfs_user_cache
+ * ages its users and groups out on a 60-second sweep, and vfs_identity.c
+ * remembers an id nothing could name for CHIMERA_VFS_IDENTITY_NEGATIVE_TTL,
+ * also 60 seconds.  An untimed layer on top of those throws that property
+ * away -- a resolve that came back partial because one group lookup happened
+ * to hiccup (and the negative cache guarantees the hiccup is remembered for a
+ * while) would otherwise be the answer for the rest of the thread's life, with
+ * the caller silently losing every access that group SID grants.
+ *
+ * Matching the layer below is what makes the retry worth taking: by the time
+ * an entry expires, the negative that spoiled it has expired too, so the
+ * re-resolve asks the handlers again rather than replaying the same refusal.
+ */
+#define CHIMERA_VFS_CRED_SIDS_TTL     60
+
 struct chimera_vfs_cred_sids_entry {
     struct chimera_vfs_cred_sids_entry *next;
     uint64_t                            hash;
+    /* Two distinct facts, because the callers need to tell them apart.
+     * `resolved`: a resolve ran to completion for this credential, whatever it
+     * found -- a caller that cannot park (the NFS per-request funnel) tests
+     * this to decide whether starting one is worth it, and a deployment with
+     * no SID source at all would otherwise re-fan-out 1 + ngids lookups on
+     * every single request forever.  `valid`: that resolve named at least one
+     * SID, so there is a set worth handing out.  `expiration` ages both out;
+     * see CHIMERA_VFS_CRED_SIDS_TTL. */
+    int                                 resolved;
     int                                 valid;
+    uint64_t                            expiration;
     /* Resolves still filling this entry, plus the callback each of them is
      * running.  An entry with either outstanding must not be recycled under a
      * different credential: a resolve holds it by pointer and would publish
@@ -42,6 +71,7 @@ struct chimera_vfs_cred_sids_entry {
 };
 
 struct chimera_vfs_cred_sids_cache {
+    uint32_t                            ttl;
     struct chimera_vfs_cred_sids_entry *buckets[CHIMERA_VFS_CRED_SIDS_BUCKETS];
 };
 
@@ -57,6 +87,14 @@ struct chimera_vfs_cred_sids_ctx {
     uint32_t                            pending;
     chimera_vfs_cred_sids_callback      callback;
     void                               *private_data;
+    /* The set being built.  A resolve fills its OWN set and moves it into the
+     * entry whole at the join, rather than writing through to the entry as it
+     * goes.  The entry therefore keeps answering with whatever it last
+     * published until the replacement is complete: a refresh at the end of the
+     * TTL never leaves a caller transiently unresolved (which, on a path that
+     * proceeds on a miss, means transiently denied), and two resolves running
+     * on the same entry cannot show each other's half-built work. */
+    struct chimera_vfs_cred_sids        set;
     struct chimera_vfs_cred_sids_slot   slots[CHIMERA_VFS_CRED_MAX_GIDS + 2];
 };
 
@@ -110,6 +148,38 @@ chimera_vfs_cred_sids_set_key(
     memcpy(entry->gids, cred->gids,
            chimera_vfs_cred_sids_ngids(cred) * sizeof(cred->gids[0]));
 } /* chimera_vfs_cred_sids_set_key */
+
+/* Coarse monotonic seconds; entry expiry is the only thing that reads it. */
+static inline uint64_t
+chimera_vfs_cred_sids_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return (uint64_t) ts.tv_sec;
+} /* chimera_vfs_cred_sids_now */
+
+/* This thread's cache, created on first use. */
+static inline struct chimera_vfs_cred_sids_cache *
+chimera_vfs_cred_sids_cache(struct chimera_vfs_thread *thread)
+{
+    if (!thread->cred_sids) {
+        thread->cred_sids      = calloc(1, sizeof(*thread->cred_sids));
+        thread->cred_sids->ttl = CHIMERA_VFS_CRED_SIDS_TTL;
+    }
+
+    return thread->cred_sids;
+} /* chimera_vfs_cred_sids_cache */
+
+/* Has a resolve completed for this entry, recently enough to still believe? */
+static inline int
+chimera_vfs_cred_sids_fresh(
+    const struct chimera_vfs_cred_sids_entry *entry,
+    uint64_t                                  now)
+{
+    return entry->resolved && now < entry->expiration;
+} /* chimera_vfs_cred_sids_fresh */
 
 /*
  * Bucket index for a credential hash.
@@ -175,10 +245,11 @@ chimera_vfs_cred_sids_find(
 } /* chimera_vfs_cred_sids_find */
 
 /*
- * Get or create the entry for `hash`.  A new entry starts invalid: a concurrent
- * lookup must not see a half-built set, and a resolve that names nothing leaves
- * it invalid so the next attempt retries (the identity layer's negative cache
- * is what keeps that retry cheap).
+ * Get or create the entry for `hash`.  A new entry starts neither resolved nor
+ * valid: a lookup must not see a half-built set, and a resolve that names
+ * nothing publishes itself as resolved-but-not-valid, which is the answer a
+ * caller that cannot park needs in order to stop asking for it (until the
+ * entry expires and the question is worth asking again).
  */
 static struct chimera_vfs_cred_sids_entry *
 chimera_vfs_cred_sids_intern(
@@ -190,9 +261,7 @@ chimera_vfs_cred_sids_intern(
     unsigned int                        b;
     int                                 n = 0;
 
-    if (!thread->cred_sids) {
-        thread->cred_sids = calloc(1, sizeof(*thread->cred_sids));
-    }
+    chimera_vfs_cred_sids_cache(thread);
 
     entry = chimera_vfs_cred_sids_find(thread, cred, hash);
     if (entry) {
@@ -264,12 +333,21 @@ chimera_vfs_cred_sids_decr(struct chimera_vfs_cred_sids_ctx *ctx)
 
     /* A set with nothing in it is reported as no set at all, so a caller can
      * tell "this caller has no native identity" from "this caller is alice". */
-    any = chimera_sid_present(&entry->sids.user);
-    for (uint32_t i = 0; !any && i < entry->sids.ngroups; i++) {
-        any = chimera_sid_present(&entry->sids.groups[i]);
+    any = chimera_sid_present(&ctx->set.user);
+    for (uint32_t i = 0; !any && i < ctx->set.ngroups; i++) {
+        any = chimera_sid_present(&ctx->set.groups[i]);
     }
 
-    entry->valid = any;
+    /* Publish the outcome in one move: resolved either way -- that is what
+     * tells a caller which cannot park that asking again is pointless --
+     * valid only if it named something, and both believed until the TTL runs
+     * out.  A refresh that comes back with less than the last one replaces it
+     * rather than leaving the old grant standing. */
+    entry->sids       = ctx->set;
+    entry->valid      = any;
+    entry->resolved   = 1;
+    entry->expiration = chimera_vfs_cred_sids_now() +
+        ctx->thread->cred_sids->ttl;
 
     free(ctx);
 
@@ -299,8 +377,8 @@ chimera_vfs_cred_sids_resolve_cb(
         sidstr = result->is_group ? result->group.sid : result->user.sid;
 
         if (sidstr && sidstr[0]) {
-            dst = (slot->index < 0) ? &ctx->entry->sids.user
-                                    : &ctx->entry->sids.groups[slot->index];
+            dst = (slot->index < 0) ? &ctx->set.user
+                                    : &ctx->set.groups[slot->index];
             /* A malformed SID from a handler leaves the slot absent, which is
              * the same as unresolved: it matches nobody. */
             if (chimera_sid_from_str(dst, sidstr) != 0) {
@@ -312,18 +390,64 @@ chimera_vfs_cred_sids_resolve_cb(
     chimera_vfs_cred_sids_decr(ctx);
 } /* chimera_vfs_cred_sids_resolve_cb */
 
+SYMBOL_EXPORT int
+chimera_vfs_cred_sids_probe(
+    struct chimera_vfs_thread           *thread,
+    const struct chimera_vfs_cred       *cred,
+    const struct chimera_vfs_cred_sids **sids)
+{
+    struct chimera_vfs_cred_sids_entry *entry;
+
+    *sids = NULL;
+
+    entry = chimera_vfs_cred_sids_find(thread, cred,
+                                       chimera_vfs_cred_hash(cred));
+
+    if (!entry) {
+        return 0;
+    }
+
+    /* Whatever this entry last published is handed out even once it is past
+     * its TTL: expiry is a refresh trigger, not an invalidation.  Withholding
+     * the set until the refresh lands would leave this caller unenforced --
+     * on the NFS funnel, denied -- for every request in that window, once per
+     * TTL.  A refresh replaces the set whole, so nothing served here is ever
+     * older than one TTL plus one resolve. */
+    if (entry->valid) {
+        *sids = &entry->sids;
+    }
+
+    if (chimera_vfs_cred_sids_fresh(entry, chimera_vfs_cred_sids_now())) {
+        return 1;
+    }
+
+    /* Never resolved, or resolved too long ago to believe, so the caller
+     * should start one -- unless one is already running, which counts as an
+     * answer on its way.  That is also what stops the requests arriving while
+     * a caller's first resolve is parked from each stacking a 1 + ngids
+     * fan-out of their own. */
+    return entry->inflight != 0;
+} /* chimera_vfs_cred_sids_probe */
+
 SYMBOL_EXPORT const struct chimera_vfs_cred_sids *
 chimera_vfs_cred_sids_lookup(
     struct chimera_vfs_thread     *thread,
     const struct chimera_vfs_cred *cred)
 {
-    struct chimera_vfs_cred_sids_entry *entry;
+    const struct chimera_vfs_cred_sids *sids;
 
-    entry = chimera_vfs_cred_sids_find(thread, cred,
-                                       chimera_vfs_cred_hash(cred));
+    chimera_vfs_cred_sids_probe(thread, cred, &sids);
 
-    return (entry && entry->valid) ? &entry->sids : NULL;
+    return sids;
 } /* chimera_vfs_cred_sids_lookup */
+
+SYMBOL_EXPORT void
+chimera_vfs_cred_sids_set_ttl(
+    struct chimera_vfs_thread *thread,
+    uint32_t                   seconds)
+{
+    chimera_vfs_cred_sids_cache(thread)->ttl = seconds;
+} /* chimera_vfs_cred_sids_set_ttl */
 
 SYMBOL_EXPORT void
 chimera_vfs_cred_resolve_sids(
@@ -352,8 +476,14 @@ chimera_vfs_cred_resolve_sids(
 
     /* Warm: no allocation, no lookup, no park.  Pinned across the callback for
      * the same reason the cold path is -- the callback holds the set, and a
-     * resolve it starts of its own must not evict it underneath. */
-    if (entry && entry->valid) {
+     * resolve it starts of its own must not evict it underneath.
+     *
+     * An entry past its TTL falls through to the cold path instead, which
+     * re-resolves it in place: that is how a set that came back partial (or
+     * empty) because the identity layer was having a bad minute heals itself
+     * rather than standing for the life of the thread. */
+    if (entry && entry->valid &&
+        chimera_vfs_cred_sids_fresh(entry, chimera_vfs_cred_sids_now())) {
         entry->inflight++;
         callback(&entry->sids, private_data);
         entry->inflight--;
@@ -362,22 +492,11 @@ chimera_vfs_cred_resolve_sids(
 
     entry = chimera_vfs_cred_sids_intern(thread, cred, hash);
 
-    /* Only reset an entry nothing else is filling.  A resolve already running
-     * here is running on the same credential -- the entry key is compared in
-     * full, so a joined entry cannot belong to a different caller -- and is
-     * writing the same slots from the same ids, so joining it in place is
-     * idempotent, where clearing under it would discard what it has already
-     * resolved. */
-    if (entry->inflight == 0) {
-        memset(&entry->sids, 0, sizeof(entry->sids));
-        entry->valid = 0;
-
-        /* groups[] is the primary gid followed by the supplementary ones, in
-         * the order the credential carries them, so a slot index maps straight
-         * back to the gid it came from. */
-        entry->sids.ngroups = 1 + chimera_vfs_cred_sids_ngids(cred);
-    }
-
+    /* The entry is the destination, not the workspace: this resolve builds its
+     * set in its own context and moves it in at the join.  Nothing here
+     * disturbs what the entry is currently answering with, and a resolve
+     * already running on this entry (necessarily on the same credential -- the
+     * key is compared in full) neither sees nor is seen by this one. */
     entry->inflight++;
 
     ctx               = calloc(1, sizeof(*ctx));
@@ -386,6 +505,11 @@ chimera_vfs_cred_resolve_sids(
     ctx->callback     = callback;
     ctx->private_data = private_data;
     ctx->pending      = 1; /* guard until every lookup is issued */
+
+    /* groups[] is the primary gid followed by the supplementary ones, in the
+     * order the credential carries them, so a slot index maps straight back to
+     * the gid it came from. */
+    ctx->set.ngroups = 1 + chimera_vfs_cred_sids_ngids(cred);
 
     nslots = 0;
 
@@ -398,7 +522,7 @@ chimera_vfs_cred_resolve_sids(
                                  &ctx->slots[nslots]);
     nslots++;
 
-    for (i = 0; i < entry->sids.ngroups; i++) {
+    for (i = 0; i < ctx->set.ngroups; i++) {
         uint32_t gid = (i == 0) ? cred->gid : cred->gids[i - 1];
 
         ctx->slots[nslots].ctx   = ctx;
