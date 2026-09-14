@@ -13,6 +13,7 @@
 #include "portmap_xdr.h"
 #include "vfs/vfs.h"
 #include "vfs/sdk/vfs_cred.h"
+#include "vfs/vfs_cred_sids.h"
 #include "nfs_gss.h"
 #include "nfs_mount_xdr.h"
 #include "nfs3_xdr.h"
@@ -117,6 +118,15 @@ struct nfs_request {
      * decoded, so squashing is not applied cumulatively when an NFSv4 compound
      * switches between exports with different policies. */
     struct chimera_vfs_cred           orig_cred;
+    /* Backing storage for cred.sids and orig_cred.sids when the per-thread
+     * resolver has a SID set for this caller (see chimera_nfs_map_cred_req).
+     * A looked-up set is only borrowed from the thread's cache and can be
+     * evicted by another request's resolve, so it is copied here rather than
+     * pointed to directly; this request owns the copy and outlives every
+     * struct copy of cred it hands out (fh decode, putfh/putrootfh/restorefh).
+     * Unused (and cred.sids is NULL) when the caller is unresolved or the
+     * credential has been squashed to the export's anonymous identity. */
+    struct chimera_vfs_cred_sids      cred_sids;
     /* RPC principal of the caller, captured at compound entry for EXCHANGE_ID
      * client-record matching (RFC 8881 §18.35.4).  machinename points into the
      * request message buffer, valid for the lifetime of the request. */
@@ -683,7 +693,35 @@ chimera_nfs_map_cred_req(
     struct nfs_request          *req,
     const struct evpl_rpc2_cred *rpc_cred)
 {
+    const struct chimera_vfs_cred_sids *sids;
+
     chimera_nfs_map_cred(&req->cred, rpc_cred);
+
+    /*
+     * Attach the caller's native SIDs so an ACE carrying only a domain SID can
+     * be matched against it (see cred_matches_sid in vfs_acl.c).  This runs on
+     * the synchronous RPC path, so it takes only what the thread's cache
+     * already has and starts a resolve on a miss rather than parking: an
+     * unseen caller's first request is evaluated with no SID set -- today's
+     * behavior, and fail-closed -- and every request after it is enforced.
+     *
+     * chimera_vfs_cred_sids_lookup() hands back a set borrowed from the
+     * thread's cache, valid only until this thread's next resolve or warm --
+     * a later request on the same thread could evict it out from under
+     * req->cred.sids.  Copy it into the request's own cred_sids (pooled with
+     * the request, so the cost is amortized over the pool high-water mark
+     * rather than paid per operation) and point at that instead of the
+     * borrowed entry.
+     */
+    sids = chimera_vfs_cred_sids_lookup(req->thread->vfs_thread, &req->cred);
+
+    if (sids) {
+        req->cred_sids = *sids;
+        req->cred.sids = &req->cred_sids;
+    } else {
+        chimera_vfs_cred_sids_warm(req->thread->vfs_thread, &req->cred);
+    }
+
     req->orig_cred = req->cred;
     req->sec_bit   = chimera_nfs_sec_bit(rpc_cred);
 } /* chimera_nfs_map_cred_req */
