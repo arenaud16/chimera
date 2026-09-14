@@ -68,6 +68,10 @@ add_executable(vfs_cred_sids_test vfs_cred_sids_test.c)
 target_link_libraries(vfs_cred_sids_test chimera_vfs chimera_vfs_memfs evpl)
 add_test(chimera/vfs/cred_sids_test vfs_cred_sids_test)
 
+add_executable(vfs_acl_sid_enforce_test vfs_acl_sid_enforce_test.c)
+target_link_libraries(vfs_acl_sid_enforce_test chimera_vfs chimera_vfs_memfs evpl)
+add_test(chimera/vfs/acl_sid_enforce_test vfs_acl_sid_enforce_test)
+
 add_executable(vfs_statfs_mask_test vfs_statfs_mask_test.c)
 target_link_libraries(vfs_statfs_mask_test chimera_vfs chimera_vfs_memfs chimera_vfs_memkv evpl)
 add_test(chimera/vfs/statfs_mask_test vfs_statfs_mask_test)
